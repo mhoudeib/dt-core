@@ -136,7 +136,7 @@ class UnicornIntersectionNode(DTROS):
         directions = []
         for alpha in alphas:
             rel = g.SE2.group_from_algebra(vel * alpha)
-            inter_pose = g.SE2.multiply(g_stop_pose, rel)
+            inter_pose = rel  # g.SE2.multiply(g_stop_pose, rel)
             position, direction = g.translation_angle_from_SE2(inter_pose)
             print(f"Adding waypoint:  position {position}, angle {direction}")
             waypoints.append(position)
