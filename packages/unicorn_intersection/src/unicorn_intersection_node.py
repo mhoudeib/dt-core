@@ -49,10 +49,15 @@ class UnicornIntersectionNode(DTROS):
         }
 
         self.reference_trajectory = []
+        self.last_waypoints = []
+        self.last_directions = []
+        self.plan_pose_odom = None
+        self.stop_frame_robot_ref = None
 
         ## Internal variables
         self.turn_type = -1
         self.stop_line_pose = Pose2D()
+        self.g_stop_pose_plan = None
 
         self.debug = False
 
@@ -72,6 +77,8 @@ class UnicornIntersectionNode(DTROS):
             Odometry,
             queue_size=self.num_waypoints,
         )
+        self.pub_path = rospy.Publisher("~path", Path, queue_size=1)
+        self.pub_markers = rospy.Publisher("~markers", MarkerArray, queue_size=1)
         self.pub_debug_trajectory_img = rospy.Publisher(
             "~debug/trajectory/compressed",
             CompressedImage,
@@ -85,6 +92,7 @@ class UnicornIntersectionNode(DTROS):
 
         ## update Parameters timer
         self.params_update = rospy.Timer(rospy.Duration.from_sec(1.0), self.updateParams)
+        self.debug_viz_timer = rospy.Timer(rospy.Duration.from_sec(1.0), self.publish_debug_timer_cb)
 
         ## Deadreckoning 
 
@@ -123,6 +131,9 @@ class UnicornIntersectionNode(DTROS):
     # stop line distance? TODO
     def calculate_goal_trajectory(self):
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
+        self.g_stop_pose_plan = g_stop_pose
+        self.plan_pose_odom = None  # unused in visualization now
+        self.stop_frame_robot_ref = None
         # TODO what if we don't want to use the stop_pose?
 
         # TODO this should really be turned into an enum
@@ -141,23 +152,51 @@ class UnicornIntersectionNode(DTROS):
         p, d = g.translation_angle_from_SE2(robot_frame_goal_pose)
         print(f"goal_pose in robot frame: position {p}, angle  {d}")
 
-        # Step 2: Interpolate along the trajectory to generate waypoints
-        vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
-        alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
         waypoints = []
         directions = []
-        for alpha in alphas:
-            rel = g.SE2.group_from_algebra(vel * alpha)
-            inter_pose = g.SE2.multiply(g_stop_pose, rel)
-            position, direction = g.translation_angle_from_SE2(inter_pose)
-            print(f"Adding waypoint:  position {position}, angle {direction}")
-            waypoints.append(position)
-            directions.append(direction)
+
+        # Step 2: Interpolate along the trajectory to generate waypoints
+        if self.turn_type == 0 and self.use_left_turn_via_point:
+            # Split the path: stop -> via, via -> goal to increase curvature without moving the final pose
+            via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
+            seg1_count = max(1, self.num_waypoints // 2)
+            seg2_count = max(1, self.num_waypoints - seg1_count)
+
+            w1, d1 = self.interpolate_segment(g_stop_pose, via_pose, seg1_count)
+            w2, d2 = self.interpolate_segment(via_pose, canonical_goal_pose, seg2_count)
+            waypoints.extend(w1 + w2)
+            directions.extend(d1 + d2)
+        else:
+            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, self.num_waypoints)
+            waypoints.extend(w)
+            directions.extend(d)
 
         # Step 3 (optional): Publish the trajectory for visualization in RVIZ
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
+            self.last_waypoints = waypoints
+            self.last_directions = directions
+        else:
+            self.last_waypoints = []
+            self.last_directions = []
+        # Publish path/markers for RViz overlay
+        self.publish_path_and_markers(waypoints, directions, g_stop_pose)
         return waypoints
+
+    def interpolate_segment(self, start_pose, end_pose, num_points):
+        """Interpolate SE(2) trajectory between two poses."""
+        robot_frame_goal_pose = g.SE2.multiply(g.SE2.inverse(start_pose), end_pose)
+        vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
+        alphas = [x/num_points for x in range(1, num_points+1)]
+        waypoints = []
+        directions = []
+        for alpha in alphas:
+            rel = g.SE2.group_from_algebra(vel * alpha)
+            inter_pose = g.SE2.multiply(start_pose, rel)
+            position, direction = g.translation_angle_from_SE2(inter_pose)
+            waypoints.append(position)
+            directions.append(direction)
+        return waypoints, directions
 
     def visualize_trajectory(self,waypoints, directions):
         for i in range(len(waypoints)):
@@ -213,10 +252,67 @@ class UnicornIntersectionNode(DTROS):
         cv2.line(img, (center_x, 0), (center_x, img_size), (200, 200, 200), 2)  # Y-axis
         cv2.line(img, (0, center_y), (img_size, center_y), (200, 200, 200), 2)  # X-axis
 
-        # Draw robot position (at origin)
-        cv2.circle(img, (center_x, center_y), 15, (0, 255, 0), -1)  # Green circle for robot
-        cv2.putText(img, "Robot", (center_x - 30, center_y - 20),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
+        # Draw stop lines (current approach + target approaches) to visualize intersection layout
+        def draw_stop_line_at(pose_dict, color, thickness=2):
+            length = 0.25
+            half = length / 2.0
+            theta = pose_dict['theta']
+            dx = half * np.cos(theta + np.pi / 2)
+            dy = half * np.sin(theta + np.pi / 2)
+            cx = pose_dict['x']
+            cy = pose_dict['y']
+            p1 = to_pixel_coords((cx - dx, cy - dy))
+            p2 = to_pixel_coords((cx + dx, cy + dy))
+            cv2.line(img, p1, p2, color, thickness)
+
+        # Incoming stop line (detected)
+        # draw_stop_line_at(
+        #     {'x': 0.0, 'y': 0.0, 'theta': self.stop_line_pose.theta},
+        #     (0, 0, 0),
+        #     thickness=3,
+        # )
+        # Outgoing/other approaches based on canonical goals
+        draw_stop_line_at(self.canonical_goal_pose_right, (0, 0, 255))       # blue-ish
+        draw_stop_line_at(self.canonical_goal_pose_left, (0, 128, 255))      # orange-ish
+        draw_stop_line_at(self.canonical_goal_pose_straight, (128, 0, 128))  # purple
+        # Reference stop line at origin (assumed ideal pose)
+        draw_stop_line_at({'x': 0.0, 'y': 0.0, 'theta': 0.0}, (0, 0, 0))
+
+        # Draw robot position(s) (transformed into stop-line frame for visualization)
+        if self.g_stop_pose_plan is not None:
+            stop_T_robot = g.SE2.multiply(
+                g.SE2.inverse(self.g_stop_pose_plan),
+                g.SE2_from_xytheta([self.x, self.y, self.yaw]),
+            )
+            # Show the robot in the stop-line frame (offset visible)
+            robot_pos, robot_heading = g.translation_angle_from_SE2(stop_T_robot)
+            robot_px = to_pixel_coords(robot_pos)
+            cv2.circle(img, robot_px, 15, (0, 200, 0), -1)  # Green circle for robot (darker)
+            cv2.putText(img, "Robot", (robot_px[0] - 30, robot_px[1] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
+            # Heading arrow
+            arrow_length = 35
+            end_x = int(robot_px[0] + arrow_length * np.cos(robot_heading))
+            end_y = int(robot_px[1] - arrow_length * np.sin(robot_heading))
+            cv2.arrowedLine(img, robot_px, (end_x, end_y), (0, 180, 0), 2, tipLength=0.3)
+
+            # Also show normalized robot at origin for reference (paler)
+            if self.stop_frame_robot_ref is None:
+                self.stop_frame_robot_ref = stop_T_robot
+            stop_T_robot_rel = g.SE2.multiply(g.SE2.inverse(self.stop_frame_robot_ref), stop_T_robot)
+            norm_pos, norm_heading = g.translation_angle_from_SE2(stop_T_robot_rel)
+            norm_px = to_pixel_coords(norm_pos)
+            cv2.circle(img, norm_px, 12, (180, 255, 180), -1)  # Pale green
+            arrow_length = 30
+            end_x = int(norm_px[0] + arrow_length * np.cos(norm_heading))
+            end_y = int(norm_px[1] - arrow_length * np.sin(norm_heading))
+            cv2.arrowedLine(img, norm_px, (end_x, end_y), (180, 230, 180), 2, tipLength=0.3)
+            cv2.putText(img, "Norm", (norm_px[0] - 20, norm_px[1] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 120, 80), 2)
+        else:
+            cv2.circle(img, (center_x, center_y), 15, (0, 255, 0), -1)
+            cv2.putText(img, "Robot", (center_x - 30, center_y - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
 
         # Draw trajectory path (connecting lines)
         if len(waypoints) > 1:
@@ -267,6 +363,103 @@ class UnicornIntersectionNode(DTROS):
         # Publish the debug image
         self.pub_debug_trajectory_img.publish(msg)
         rospy.loginfo(f"[{self.node_name}] Published trajectory debug image with {len(waypoints)} waypoints")
+
+    def publish_debug_timer_cb(self, _event):
+        """Periodic refresh of the debug image during execution."""
+        if not self.visualization or self.internal_state != "EXECUTING":
+            return
+        if not self.last_waypoints or not self.last_directions or self.g_stop_pose_plan is None:
+            return
+        self.publish_trajectory_debug_image(self.last_waypoints, self.last_directions)
+
+    def publish_path_and_markers(self, waypoints, directions, g_stop_pose):
+        """
+        Publish nav_msgs/Path and markers in odom frame so RViz can show the planned intersection path
+        relative to the robot pose and stop line.
+        """
+        now = rospy.Time.now()
+        odom_T_stop = g.SE2.multiply(g.SE2_from_xytheta([self.x, self.y, self.yaw]), g_stop_pose)
+
+        path_msg = Path()
+        path_msg.header.frame_id = "odom"
+        path_msg.header.stamp = now
+
+        for pos, heading in zip(waypoints, directions):
+            wp_se2 = g.SE2_from_xytheta([pos[0], pos[1], heading])
+            wp_odom = g.SE2.multiply(odom_T_stop, wp_se2)
+            wp_translation, wp_heading = g.translation_angle_from_SE2(wp_odom)
+
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = wp_translation[0]
+            ps.pose.position.y = wp_translation[1]
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.z = np.sin(wp_heading / 2.0)
+            ps.pose.orientation.w = np.cos(wp_heading / 2.0)
+            path_msg.poses.append(ps)
+
+        markers = []
+        marker_id = 0
+
+        # Stop line segment marker (red line)
+        stop_marker = Marker()
+        stop_marker.header = path_msg.header
+        stop_marker.ns = "stop_line"
+        stop_marker.id = marker_id
+        marker_id += 1
+        stop_marker.type = Marker.LINE_STRIP
+        stop_marker.action = Marker.ADD
+        stop_marker.scale.x = 0.02
+        stop_marker.color.r = 1.0
+        stop_marker.color.a = 1.0
+
+        stop_len = 0.3
+        cx = odom_T_stop[0, 2]
+        cy = odom_T_stop[1, 2]
+        ctheta = math.atan2(odom_T_stop[1, 0], odom_T_stop[0, 0])
+        dx = (stop_len / 2.0) * math.cos(ctheta + math.pi / 2.0)
+        dy = (stop_len / 2.0) * math.sin(ctheta + math.pi / 2.0)
+        p1 = Point(x=cx - dx, y=cy - dy, z=0.0)
+        p2 = Point(x=cx + dx, y=cy + dy, z=0.0)
+        stop_marker.points = [p1, p2]
+        markers.append(stop_marker)
+
+        # Start marker (green sphere at stop line)
+        start_marker = Marker()
+        start_marker.header = path_msg.header
+        start_marker.ns = "start"
+        start_marker.id = marker_id
+        marker_id += 1
+        start_marker.type = Marker.SPHERE
+        start_marker.action = Marker.ADD
+        start_marker.scale.x = start_marker.scale.y = start_marker.scale.z = 0.05
+        start_marker.color.g = 1.0
+        start_marker.color.a = 1.0
+        start_marker.pose.position.x = cx
+        start_marker.pose.position.y = cy
+        start_marker.pose.position.z = 0.0
+        markers.append(start_marker)
+
+        # Goal marker (magenta sphere at last waypoint)
+        if path_msg.poses:
+            goal_marker = Marker()
+            goal_marker.header = path_msg.header
+            goal_marker.ns = "goal"
+            goal_marker.id = marker_id
+            marker_id += 1
+            goal_marker.type = Marker.SPHERE
+            goal_marker.action = Marker.ADD
+            goal_marker.scale.x = goal_marker.scale.y = goal_marker.scale.z = 0.06
+            goal_marker.color.r = 1.0
+            goal_marker.color.b = 1.0
+            goal_marker.color.a = 1.0
+            goal_marker.pose = path_msg.poses[-1].pose
+            markers.append(goal_marker)
+
+        marker_array = MarkerArray(markers=markers)
+
+        self.pub_path.publish(path_msg)
+        self.pub_markers.publish(marker_array)
 
     def reset_odometry(self):
         self.left_encoder_last = None
