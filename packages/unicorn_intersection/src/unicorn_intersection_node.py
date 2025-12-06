@@ -11,9 +11,10 @@ from duckietown_msgs.msg import BoolStamped, \
 
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
 import math
-from geometry_msgs.msg import Quaternion, Twist, Pose2D, Point, Vector3, TransformStamped, Transform
+from geometry_msgs.msg import Quaternion, Twist, Pose2D, Point, Vector3, TransformStamped, Transform, PoseStamped
 
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
+from visualization_msgs.msg import Marker, MarkerArray
 from sensor_msgs.msg import CompressedImage
 
 import message_filters
@@ -121,74 +122,39 @@ class UnicornIntersectionNode(DTROS):
     # goal pose relative to the stop line. If not using the stop line then we can use some fixed offset based on the
     # stop line distance? TODO
     def calculate_goal_trajectory(self):
-        # Apply offset to stop line position (move the "start" point forward/backward)
-        # This creates an adjusted stop pose that accounts for where we want the trajectory to start
-        stop_line_with_offset = g.SE2_from_xytheta([
-            self.stop_line_pose.x + self.stop_line_offset * np.cos(self.stop_line_pose.theta),
-            self.stop_line_pose.y + self.stop_line_offset * np.sin(self.stop_line_pose.theta),
-            self.stop_line_pose.theta
-        ])
+        g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
+        # TODO what if we don't want to use the stop_pose?
 
-        rospy.loginfo(f"[unicorn_intersection_node] Stop line pose: x={self.stop_line_pose.x:.3f}, y={self.stop_line_pose.y:.3f}, theta={self.stop_line_pose.theta:.3f}")
-        rospy.loginfo(f"[unicorn_intersection_node] Using stop line offset: {self.stop_line_offset:.3f}m")
-
-        # Step 1 - Get the canonical goal pose based on turn type
+        # TODO this should really be turned into an enum
+        # Step 1 - calculate the goal pose in the robot frame
         if self.turn_type == 0:
             canonical_goal_pose = self.goal_poses['left']
-            is_left_turn = True
         elif self.turn_type == 1:
             canonical_goal_pose = self.goal_poses['straight']
-            is_left_turn = False
         elif self.turn_type == 2:
             canonical_goal_pose = self.goal_poses['right']
-            is_left_turn = False
         else:
             rospy.logerr("[unicorn_intersection_node] Something went wrong, invalid turn type")
-            is_left_turn = False
 
-        # Step 2: For left turns, add forward offset to start position and create via waypoint
-        waypoints = []
-        directions = []
-
-        if is_left_turn and self.use_left_turn_via_point:
-            # Create a forward-shifted start position for left turns
-            via_point_canonical = self.dictionary_pose_to_geometry(self.left_turn_via_point)
-
-            # Add via point as the first waypoint (robot goes straight to this point)
-            via_point_robot = g.SE2.multiply(g.SE2.inverse(stop_line_with_offset), via_point_canonical)
-            via_point_world = g.SE2.multiply(stop_line_with_offset, via_point_robot)
-            via_position, via_direction = g.translation_angle_from_SE2(via_point_world)
-            waypoints.append(via_position)
-            directions.append(via_direction)
-            rospy.loginfo(f"[unicorn_intersection_node] Left turn via waypoint: position {via_position}, angle {via_direction:.3f}")
-
-            # Now calculate remaining waypoints from via point to goal
-            start_pose_for_interpolation = via_point_world
-            remaining_waypoints = self.num_waypoints - 1
-        else:
-            # For right and straight turns, start from stop line position
-            start_pose_for_interpolation = stop_line_with_offset
-            remaining_waypoints = self.num_waypoints
-
-        # Step 3: Calculate goal pose relative to the start pose and interpolate waypoints
-        robot_frame_goal_pose = g.SE2.multiply(g.SE2.inverse(start_pose_for_interpolation), canonical_goal_pose)
+        robot_frame_goal_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), canonical_goal_pose)
 
         p, d = g.translation_angle_from_SE2(robot_frame_goal_pose)
-        rospy.loginfo(f"[unicorn_intersection_node] Goal pose in robot frame: position {p}, angle {d:.3f}")
+        print(f"goal_pose in robot frame: position {p}, angle  {d}")
 
-        # Interpolate along the trajectory to generate remaining waypoints
+        # Step 2: Interpolate along the trajectory to generate waypoints
         vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
-        alphas = [x/remaining_waypoints for x in range(1, remaining_waypoints+1)]
-
+        alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
+        waypoints = []
+        directions = []
         for alpha in alphas:
             rel = g.SE2.group_from_algebra(vel * alpha)
-            inter_pose = g.SE2.multiply(start_pose_for_interpolation, rel)
+            inter_pose = g.SE2.multiply(g_stop_pose, rel)
             position, direction = g.translation_angle_from_SE2(inter_pose)
-            rospy.loginfo(f"[unicorn_intersection_node] Waypoint {len(waypoints)}: position {position}, angle {direction:.3f}")
+            print(f"Adding waypoint:  position {position}, angle {direction}")
             waypoints.append(position)
             directions.append(direction)
 
-        # Step 4 (optional): Publish the trajectory for visualization
+        # Step 3 (optional): Publish the trajectory for visualization in RVIZ
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
         return waypoints
