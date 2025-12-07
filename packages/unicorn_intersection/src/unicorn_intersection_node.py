@@ -58,6 +58,7 @@ class UnicornIntersectionNode(DTROS):
         self.turn_type = -1
         self.stop_line_pose = Pose2D()
         self.g_stop_pose_plan = None
+        self.num_waypoints = None
 
         self.debug = False
 
@@ -132,18 +133,18 @@ class UnicornIntersectionNode(DTROS):
     def calculate_goal_trajectory(self):
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
         self.g_stop_pose_plan = g_stop_pose
-        self.plan_pose_odom = None  # unused in visualization now
+        self.plan_pose_odom = None
         self.stop_frame_robot_ref = None
-        # TODO what if we don't want to use the stop_pose?
 
-        # TODO this should really be turned into an enum
-        # Step 1 - calculate the goal pose in the robot frame
         if self.turn_type == 0:
             canonical_goal_pose = self.goal_poses['left']
+            self.num_waypoints = self.left_num_waypoints
         elif self.turn_type == 1:
             canonical_goal_pose = self.goal_poses['straight']
+            self.num_waypoints = self.straight_num_waypoints
         elif self.turn_type == 2:
             canonical_goal_pose = self.goal_poses['right']
+            self.num_waypoints = self.right_num_waypoints
         else:
             rospy.logerr("[unicorn_intersection_node] Something went wrong, invalid turn type")
 
@@ -155,23 +156,35 @@ class UnicornIntersectionNode(DTROS):
         waypoints = []
         directions = []
 
-        # Step 2: Interpolate along the trajectory to generate waypoints
         if self.turn_type == 0 and self.use_left_turn_via_point:
-            # Split the path: stop -> via, via -> goal to increase curvature without moving the final pose
             via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
-            seg1_count = max(1, self.num_waypoints // 2)
-            seg2_count = max(1, self.num_waypoints - seg1_count)
+            seg1_count = max(1, self.left_num_waypoints // 2)
+            seg2_count = max(1, self.left_num_waypoints - seg1_count)
 
             w1, d1 = self.interpolate_segment(g_stop_pose, via_pose, seg1_count)
             w2, d2 = self.interpolate_segment(via_pose, canonical_goal_pose, seg2_count)
             waypoints.extend(w1 + w2)
             directions.extend(d1 + d2)
         else:
-            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, self.num_waypoints)
+            if self.turn_type == 0:
+                num_wp = self.left_num_waypoints
+            elif self.turn_type == 1:
+                num_wp = self.straight_num_waypoints
+            else:
+                num_wp = self.right_num_waypoints
+            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, num_wp)
             waypoints.extend(w)
             directions.extend(d)
 
-        # Step 3 (optional): Publish the trajectory for visualization in RVIZ
+        # Transform waypoints to odometry frame
+        odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        waypoints_odom = []
+        for wp, dir in zip(waypoints, directions):
+            wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
+            wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
+            pos, heading = g.translation_angle_from_SE2(wp_odom)
+            waypoints_odom.append(pos)
+
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
             self.last_waypoints = waypoints
@@ -179,9 +192,9 @@ class UnicornIntersectionNode(DTROS):
         else:
             self.last_waypoints = []
             self.last_directions = []
-        # Publish path/markers for RViz overlay
+        
         self.publish_path_and_markers(waypoints, directions, g_stop_pose)
-        return waypoints
+        return waypoints_odom  # Return odometry frame waypoints!
 
     def interpolate_segment(self, start_pose, end_pose, num_points):
         """Interpolate SE(2) trajectory between two poses."""
@@ -252,31 +265,50 @@ class UnicornIntersectionNode(DTROS):
         cv2.line(img, (center_x, 0), (center_x, img_size), (200, 200, 200), 2)  # Y-axis
         cv2.line(img, (0, center_y), (img_size, center_y), (200, 200, 200), 2)  # X-axis
 
-        # Draw stop lines (current approach + target approaches) to visualize intersection layout
-        def draw_stop_line_at(pose_dict, color, thickness=2):
-            length = 0.25
-            half = length / 2.0
-            theta = pose_dict['theta']
-            dx = half * np.cos(theta + np.pi / 2)
-            dy = half * np.sin(theta + np.pi / 2)
-            cx = pose_dict['x']
-            cy = pose_dict['y']
-            p1 = to_pixel_coords((cx - dx, cy - dy))
-            p2 = to_pixel_coords((cx + dx, cy + dy))
+        # Draw an intersection layout similar to simulation: red stop lines on each approach,
+        # yellow center lines through the intersection.
+        stop_offset = 0.585 / 2.0  # distance from center to each stop line
+        stop_len = 0.585 / 2.0
+        stop_half = stop_len / 2.0
+        x_offset = 0.585 / 2.0
+        y_offset = 0.585 / 4.0
+
+        def draw_stop_line(cx, cy, heading, color, thickness=3):
+            dx = stop_half * np.cos(heading + np.pi / 2)
+            dy = stop_half * np.sin(heading + np.pi / 2)
+            p1 = to_pixel_coords((cx - dx + x_offset, cy - dy))
+            p2 = to_pixel_coords((cx + dx + x_offset, cy + dy))
             cv2.line(img, p1, p2, color, thickness)
 
-        # Incoming stop line (detected)
-        # draw_stop_line_at(
-        #     {'x': 0.0, 'y': 0.0, 'theta': self.stop_line_pose.theta},
-        #     (0, 0, 0),
-        #     thickness=3,
-        # )
-        # Outgoing/other approaches based on canonical goals
-        draw_stop_line_at(self.canonical_goal_pose_right, (0, 0, 255))       # blue-ish
-        draw_stop_line_at(self.canonical_goal_pose_left, (0, 128, 255))      # orange-ish
-        draw_stop_line_at(self.canonical_goal_pose_straight, (128, 0, 128))  # purple
-        # Reference stop line at origin (assumed ideal pose)
-        draw_stop_line_at({'x': 0.0, 'y': 0.0, 'theta': 0.0}, (0, 0, 0))
+        # Stop lines (red) for four approaches
+        draw_stop_line(-x_offset, -stop_half + y_offset, 0.0, (0, 0, 255))         # coming from left
+        draw_stop_line(x_offset, stop_half + y_offset, np.pi, (0, 0, 255))        # coming from right
+        draw_stop_line(stop_half, -stop_offset + y_offset, np.pi / 2, (0, 0, 255))   # coming from bottom
+        draw_stop_line(-stop_half, stop_offset + y_offset, -np.pi / 2, (0, 0, 255))   # coming from top
+
+        # Center lines (yellow) extending away from the center
+        center_len = 0.5
+        margin = 0.05
+        center_color = (0, 255, 255)
+
+        cv2.line(img, to_pixel_coords((x_offset*2, y_offset)), to_pixel_coords((center_len + x_offset*2, y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((0.0, y_offset)), to_pixel_coords((-center_len, y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((x_offset, stop_offset + y_offset)), to_pixel_coords((x_offset, stop_offset + center_len + y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((x_offset, -y_offset)), to_pixel_coords((x_offset, -center_len - y_offset)), center_color, 2)
+
+        # # Transform waypoints to stop frame for visualization
+        # waypoints_stop = []
+        # directions_stop = []
+        # if self.g_stop_pose_plan is not None:
+        #     for wp, direction in zip(waypoints, directions):
+        #         wp_robot = g.SE2_from_xytheta([wp[0], wp[1], direction])
+        #         wp_stop = g.SE2.multiply(g.SE2.inverse(self.g_stop_pose_plan), wp_robot)
+        #         pos, dir = g.translation_angle_from_SE2(wp_stop)
+        #         waypoints_stop.append(pos)
+        #         directions_stop.append(dir)
+        # else:
+        waypoints_stop = waypoints
+        directions_stop = directions
 
         # Draw robot position(s) (transformed into stop-line frame for visualization)
         if self.g_stop_pose_plan is not None:
@@ -284,17 +316,17 @@ class UnicornIntersectionNode(DTROS):
                 g.SE2.inverse(self.g_stop_pose_plan),
                 g.SE2_from_xytheta([self.x, self.y, self.yaw]),
             )
-            # Show the robot in the stop-line frame (offset visible)
-            robot_pos, robot_heading = g.translation_angle_from_SE2(stop_T_robot)
-            robot_px = to_pixel_coords(robot_pos)
-            cv2.circle(img, robot_px, 15, (0, 200, 0), -1)  # Green circle for robot (darker)
-            cv2.putText(img, "Robot", (robot_px[0] - 30, robot_px[1] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
-            # Heading arrow
-            arrow_length = 35
-            end_x = int(robot_px[0] + arrow_length * np.cos(robot_heading))
-            end_y = int(robot_px[1] - arrow_length * np.sin(robot_heading))
-            cv2.arrowedLine(img, robot_px, (end_x, end_y), (0, 180, 0), 2, tipLength=0.3)
+            # # Show the robot in the stop-line frame (offset visible)
+            # robot_pos, robot_heading = g.translation_angle_from_SE2(stop_T_robot)
+            # robot_px = to_pixel_coords(robot_pos)
+            # cv2.circle(img, robot_px, 15, (0, 200, 0), -1)  # Green circle for robot (darker)
+            # cv2.putText(img, "Robot", (robot_px[0] - 30, robot_px[1] - 20),
+            #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
+            # # Heading arrow
+            # arrow_length = 35
+            # end_x = int(robot_px[0] + arrow_length * np.cos(robot_heading))
+            # end_y = int(robot_px[1] - arrow_length * np.sin(robot_heading))
+            # cv2.arrowedLine(img, robot_px, (end_x, end_y), (0, 180, 0), 2, tipLength=0.3)
 
             # Also show normalized robot at origin for reference (paler)
             if self.stop_frame_robot_ref is None:
@@ -302,7 +334,7 @@ class UnicornIntersectionNode(DTROS):
             stop_T_robot_rel = g.SE2.multiply(g.SE2.inverse(self.stop_frame_robot_ref), stop_T_robot)
             norm_pos, norm_heading = g.translation_angle_from_SE2(stop_T_robot_rel)
             norm_px = to_pixel_coords(norm_pos)
-            cv2.circle(img, norm_px, 12, (180, 255, 180), -1)  # Pale green
+            cv2.circle(img, norm_px, 12, (0, 200, 0), -1)  # Pale green
             arrow_length = 30
             end_x = int(norm_px[0] + arrow_length * np.cos(norm_heading))
             end_y = int(norm_px[1] - arrow_length * np.sin(norm_heading))
@@ -322,7 +354,7 @@ class UnicornIntersectionNode(DTROS):
             initial_offset = self.stop_frame_robot_ref
 
             # Transform each waypoint by the initial offset
-            for wp, direction in zip(waypoints, directions):
+            for wp, direction in zip(waypoints_stop, directions_stop):
                 # Waypoint in stop-line frame
                 wp_se2 = g.SE2_from_xytheta([wp[0], wp[1], direction])
                 # Apply initial offset: offset_waypoint = initial_offset * waypoint
@@ -331,30 +363,30 @@ class UnicornIntersectionNode(DTROS):
                 offset_waypoints.append((offset_pos, offset_dir))
 
             # Draw the offset trajectory (what robot actually follows) in cyan/light blue
-            if len(offset_waypoints) > 1:
-                for i in range(len(offset_waypoints) - 1):
-                    pt1 = to_pixel_coords(offset_waypoints[i][0])
-                    pt2 = to_pixel_coords(offset_waypoints[i+1][0])
-                    cv2.line(img, pt1, pt2, (255, 255, 0), 2)  # Cyan for offset trajectory
+            # if len(offset_waypoints) > 1:
+            #     for i in range(len(offset_waypoints) - 1):
+            #         pt1 = to_pixel_coords(offset_waypoints[i][0])
+            #         pt2 = to_pixel_coords(offset_waypoints[i+1][0])
+            #         cv2.line(img, pt1, pt2, (255, 255, 0), 2)  # Cyan for offset trajectory
 
-            # Draw offset waypoints as smaller circles
-            for i, (off_wp, off_dir) in enumerate(offset_waypoints):
-                pixel_pos = to_pixel_coords(off_wp)
-                cv2.circle(img, pixel_pos, 5, (255, 200, 0), -1)  # Cyan circles
+            # # Draw offset waypoints as smaller circles
+            # for i, (off_wp, off_dir) in enumerate(offset_waypoints):
+            #     pixel_pos = to_pixel_coords(off_wp)
+            #     cv2.circle(img, pixel_pos, 5, (255, 200, 0), -1)  # Cyan circles
 
         # Draw ideal trajectory path (connecting lines) - what's planned
-        if len(waypoints) > 1:
-            for i in range(len(waypoints) - 1):
-                pt1 = to_pixel_coords(waypoints[i])
-                pt2 = to_pixel_coords(waypoints[i + 1])
+        if len(waypoints_stop) > 1:
+            for i in range(len(waypoints_stop) - 1):
+                pt1 = to_pixel_coords(waypoints_stop[i])
+                pt2 = to_pixel_coords(waypoints_stop[i + 1])
                 cv2.line(img, pt1, pt2, (255, 0, 0), 3)  # Blue line for ideal trajectory
 
         # Draw ideal waypoints with direction arrows
-        for i, (wp, direction) in enumerate(zip(waypoints, directions)):
+        for i, (wp, direction) in enumerate(zip(waypoints_stop, directions_stop)):
             pixel_pos = to_pixel_coords(wp)
 
             # Draw waypoint circle
-            color = (0, 0, 255) if i < len(waypoints) - 1 else (255, 0, 255)  # Red for waypoints, magenta for final
+            color = (0, 0, 255) if i < len(waypoints_stop) - 1 else (255, 0, 255)  # Red for waypoints, magenta for final
             cv2.circle(img, pixel_pos, 8, color, -1)
 
             # Draw direction arrow
@@ -371,7 +403,7 @@ class UnicornIntersectionNode(DTROS):
         turn_type_str = {0: "LEFT", 1: "STRAIGHT", 2: "RIGHT"}.get(self.turn_type, "UNKNOWN")
         cv2.putText(img, f"Intersection Trajectory - Turn: {turn_type_str}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        cv2.putText(img, f"Waypoints: {len(waypoints)}", (10, 60),
+        cv2.putText(img, f"Waypoints: {len(waypoints_stop)}", (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
         # Add legend
@@ -404,7 +436,7 @@ class UnicornIntersectionNode(DTROS):
 
         # Publish the debug image
         self.pub_debug_trajectory_img.publish(msg)
-        rospy.loginfo(f"[{self.node_name}] Published trajectory debug image with {len(waypoints)} waypoints")
+        rospy.loginfo(f"[{self.node_name}] Published trajectory debug image with {len(waypoints_stop)} waypoints")
 
     def publish_debug_timer_cb(self, _event):
         """Periodic refresh of the debug image during execution."""
@@ -641,7 +673,9 @@ class UnicornIntersectionNode(DTROS):
 
     def setupParams(self):
         self.use_stop_pose = self.setupParam("~use_stop_pose", False)
-        self.num_waypoints = self.setupParam("~num_waypoints", 2)
+        self.left_num_waypoints = self.setupParam("~left_num_waypoints", 2)
+        self.straight_num_waypoints = self.setupParam("~straight_num_waypoints", 2)
+        self.right_num_waypoints = self.setupParam("~right_num_waypoints", 2)
         self.visualization = self.setupParam("~visualization", True)
         default_pose = {'x': 0.0, 'y': 0.0, 'theta': 0.0 }
         self.canonical_goal_pose_right = self.setupParam("~canonical_goal_pose_right", default_pose)
@@ -653,6 +687,17 @@ class UnicornIntersectionNode(DTROS):
         self.left_turn_via_point = self.setupParam("~left_turn_via_point", default_left_via)
         self.use_left_turn_via_point = self.setupParam("~use_left_turn_via_point", True)
         self.speed = self.setupParam("~speed", 0.30)
+        # Waypoint counts per maneuver
+        self.left_num_waypoints = self.setupParam("~left_num_waypoints", 6)
+        self.right_num_waypoints = self.setupParam("~right_num_waypoints", 4)
+        self.straight_num_waypoints = self.setupParam("~straight_num_waypoints", 6)
+        # Waypoint reach thresholds per maneuver
+        self.left_x_threshold = self.setupParam("~left_x_threshold", 0.12)
+        self.left_dist_threshold = self.setupParam("~left_dist_threshold", 0.12)
+        self.right_x_threshold = self.setupParam("~right_x_threshold", 0.06)
+        self.right_dist_threshold = self.setupParam("~right_dist_threshold", 0.08)
+        self.straight_x_threshold = self.setupParam("~straight_x_threshold", 0.06)
+        self.straight_dist_threshold = self.setupParam("~straight_dist_threshold", 0.08)
         # Distance past the stop line where trajectory should start (in meters)
         # Positive value = start trajectory after crossing stop line
         # Negative value = start trajectory before stop line
@@ -690,8 +735,16 @@ class UnicornIntersectionNode(DTROS):
         return omega
 
     def check_point(self, current_point, target_point):
-        threshold = 0.1
-        threshold_x = 0.08
+        # Maneuver-specific thresholds to avoid skipping waypoints
+        if self.turn_type == 0:  # left
+            threshold = self.left_dist_threshold
+            threshold_x = self.left_x_threshold
+        elif self.turn_type == 1:  # straight
+            threshold = self.straight_dist_threshold
+            threshold_x = self.straight_x_threshold
+        else:  # right
+            threshold = self.right_dist_threshold
+            threshold_x = self.right_x_threshold
         dist_x = np.zeros((1,2))
         dist_x[0, 0] = (current_point[0] - self.alpha) - target_point[0]
         dist_x[0, 1] = (current_point[1]) - target_point[1]
