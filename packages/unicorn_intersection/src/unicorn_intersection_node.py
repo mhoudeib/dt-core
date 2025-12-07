@@ -314,14 +314,42 @@ class UnicornIntersectionNode(DTROS):
             cv2.putText(img, "Robot", (center_x - 30, center_y - 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2)
 
-        # Draw trajectory path (connecting lines)
+        # Calculate and draw the offset trajectory (what robot actually follows)
+        # This shows waypoints transformed by the initial robot offset
+        offset_waypoints = []
+        if self.g_stop_pose_plan is not None and self.stop_frame_robot_ref is not None:
+            # Get the initial offset when trajectory was planned
+            initial_offset = self.stop_frame_robot_ref
+
+            # Transform each waypoint by the initial offset
+            for wp, direction in zip(waypoints, directions):
+                # Waypoint in stop-line frame
+                wp_se2 = g.SE2_from_xytheta([wp[0], wp[1], direction])
+                # Apply initial offset: offset_waypoint = initial_offset * waypoint
+                offset_wp_se2 = g.SE2.multiply(initial_offset, wp_se2)
+                offset_pos, offset_dir = g.translation_angle_from_SE2(offset_wp_se2)
+                offset_waypoints.append((offset_pos, offset_dir))
+
+            # Draw the offset trajectory (what robot actually follows) in cyan/light blue
+            if len(offset_waypoints) > 1:
+                for i in range(len(offset_waypoints) - 1):
+                    pt1 = to_pixel_coords(offset_waypoints[i][0])
+                    pt2 = to_pixel_coords(offset_waypoints[i+1][0])
+                    cv2.line(img, pt1, pt2, (255, 255, 0), 2)  # Cyan for offset trajectory
+
+            # Draw offset waypoints as smaller circles
+            for i, (off_wp, off_dir) in enumerate(offset_waypoints):
+                pixel_pos = to_pixel_coords(off_wp)
+                cv2.circle(img, pixel_pos, 5, (255, 200, 0), -1)  # Cyan circles
+
+        # Draw ideal trajectory path (connecting lines) - what's planned
         if len(waypoints) > 1:
             for i in range(len(waypoints) - 1):
                 pt1 = to_pixel_coords(waypoints[i])
                 pt2 = to_pixel_coords(waypoints[i + 1])
-                cv2.line(img, pt1, pt2, (255, 0, 0), 3)  # Blue line for trajectory
+                cv2.line(img, pt1, pt2, (255, 0, 0), 3)  # Blue line for ideal trajectory
 
-        # Draw waypoints with direction arrows
+        # Draw ideal waypoints with direction arrows
         for i, (wp, direction) in enumerate(zip(waypoints, directions)):
             pixel_pos = to_pixel_coords(wp)
 
@@ -347,12 +375,26 @@ class UnicornIntersectionNode(DTROS):
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
         # Add legend
-        cv2.circle(img, (img_size - 150, 30), 8, (0, 0, 255), -1)
-        cv2.putText(img, "Waypoint", (img_size - 130, 35),
+        legend_y = 30
+        cv2.circle(img, (img_size - 150, legend_y), 8, (0, 0, 255), -1)
+        cv2.putText(img, "Ideal WP", (img_size - 130, legend_y + 5),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-        cv2.circle(img, (img_size - 150, 50), 8, (255, 0, 255), -1)
-        cv2.putText(img, "Goal", (img_size - 130, 55),
+
+        legend_y += 20
+        cv2.circle(img, (img_size - 150, legend_y), 8, (255, 0, 255), -1)
+        cv2.putText(img, "Goal", (img_size - 130, legend_y + 5),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        legend_y += 20
+        cv2.line(img, (img_size - 155, legend_y), (img_size - 145, legend_y), (255, 0, 0), 3)
+        cv2.putText(img, "Ideal Traj", (img_size - 130, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        if offset_waypoints:  # Only show if we have offset trajectory
+            legend_y += 20
+            cv2.line(img, (img_size - 155, legend_y), (img_size - 145, legend_y), (255, 255, 0), 2)
+            cv2.putText(img, "Offset Traj", (img_size - 130, legend_y + 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
 
         # Convert to ROS CompressedImage message
         msg = CompressedImage()
