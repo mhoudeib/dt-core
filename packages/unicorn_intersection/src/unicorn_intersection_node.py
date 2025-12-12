@@ -91,8 +91,8 @@ class UnicornIntersectionNode(DTROS):
         self.ts_encoders.registerCallback(self.cb_ts_encoders)
 
         ## update Parameters timer
-        self.params_update = rospy.Timer(rospy.Duration.from_sec(1.0), self.updateParams)
-        self.debug_viz_timer = rospy.Timer(rospy.Duration.from_sec(1.0), self.publish_debug_timer_cb)
+        # self.params_update = rospy.Timer(rospy.Duration.from_sec(1.0), self.updateParams)
+        # self.debug_viz_timer = rospy.Timer(rospy.Duration.from_sec(1.0), self.publish_debug_timer_cb)
 
         ## Deadreckoning 
 
@@ -446,7 +446,6 @@ class UnicornIntersectionNode(DTROS):
 
         # Publish the debug image
         self.pub_debug_trajectory_img.publish(msg)
-        rospy.loginfo(f"[{self.node_name}] Published trajectory debug image with {len(waypoints_stop)} waypoints")
 
     def publish_debug_timer_cb(self, _event):
         """Periodic refresh of the debug image during execution."""
@@ -652,6 +651,8 @@ class UnicornIntersectionNode(DTROS):
 
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
             self.iter_ += 1
+            self.publish_trajectory_debug_image(self.last_waypoints, self.last_directions)
+            rospy.loginfo(f"[{self.node_name}] Published new trajectory debug image with {self.iter_}/{self.num_waypoints} waypoints")
             if self.iter_ == self.num_waypoints:
                 self.internal_state = "READY"
                 self.stop_line_pose_received = False
@@ -769,7 +770,35 @@ class UnicornIntersectionNode(DTROS):
         else:
             dist = np.sqrt(((current_point[0]-self.alpha) - target_point[0])**2 + ((current_point[1]-self.alpha) - target_point[1])**2 )
 
-            if (abs(dist_x[0,0])) > threshold_x or (dist) < threshold:
+            # Determine whether we've passed the target along the x-direction
+            # in the direction of travel. Using abs() treats being in front
+            # and behind the same; instead compute a signed-x value and use
+            # the planned motion direction (from previous waypoint → target)
+            # to decide which sign indicates 'passed'.
+            signed_x = (current_point[0] - self.alpha) - target_point[0]
+
+            # Choose a reference previous point for direction. If available,
+            # use the previous planned waypoint; otherwise use the robot's
+            # current pose as a best-effort fallback.
+            if hasattr(self, 'reference_trajectory') and self.iter_ > 0 and (self.iter_ - 1) < len(self.reference_trajectory):
+                prev_pt = np.array(self.reference_trajectory[self.iter_ - 1])
+            else:
+                prev_pt = np.array([self.x, self.y])
+
+            motion_vec_x = target_point[0] - prev_pt[0]
+            eps = 1e-6
+            passed_x = False
+            if abs(motion_vec_x) > eps:
+                # If motion_vec_x is positive, passing means signed_x > threshold_x
+                # If negative, passing means signed_x < -threshold_x
+                direction = np.sign(motion_vec_x)
+                passed_x = (direction * signed_x) > threshold_x
+            else:
+                # If there's no clear motion in x, fall back to a simple
+                # forward-pass check (signed_x > threshold)
+                passed_x = signed_x > threshold_x
+
+            if passed_x or (dist) < threshold:
                 return True
 
             return False
