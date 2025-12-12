@@ -103,6 +103,25 @@ class UnicornIntersectionNode(DTROS):
 
         self.log("Initialialized unicorn intersection node")
 
+    def onFSMStateChange(self, msg):
+        """
+        Callback for FSM state changes. Reset odometry when switching to joystick control.
+        This is automatically called by DTROS when fsm_controlled=True.
+        """
+        new_state = msg.state
+        rospy.loginfo(f"[{self.node_name}] FSM state changed to: {new_state}")
+
+        # Reset odometry when switching to joystick control
+        if new_state == "NORMAL_JOYSTICK_CONTROL":
+            rospy.loginfo(f"[{self.node_name}] Switching to joystick control - resetting odometry")
+            self.reset_odometry()
+            # Also reset intersection state
+            self.internal_state = "READY"
+            self.stop_line_pose_received = False
+            self.turn_type_received = False
+            self.g_stop_pose_plan = None
+            self.stop_frame_robot_ref = None
+
     def cbStopLineReading(self, msg):
         if self.stop_line_pose_received:
             return
@@ -645,7 +664,8 @@ class UnicornIntersectionNode(DTROS):
         # Add commands to car message
         gainV = 0.75
         wayPoint = self.reference_trajectory[self.iter_]
-        car_control_msg.v = min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y))
+        # car_control_msg.v = self.speed
+        car_control_msg.v = max(0.1, min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y)))
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 

@@ -268,7 +268,7 @@ class LaneControllerNode(DTROS):
             factor = max(0, (distToStop-distMin)/(distMax-distMin))
 
         # Add commands to car message
-        car_control_msg.v = factor*v
+        car_control_msg.v = v
         car_control_msg.omega = omega
 
         self.publishCmd(car_control_msg)

@@ -3,10 +3,10 @@ left_num_waypoints: 6
 right_num_waypoints: 4
 straight_num_waypoints: 3
 visualization: True
-speed: 0.12
+speed: 0.20
 
 canonical_goal_pose_right: {
-  x: 0.3,
+  x: 0.2,
   y: -0.3,
   theta: -1.57,
 }
@@ -40,7 +40,7 @@ use_left_turn_via_point: True
 stop_line_offset: 0.0
 
 # Waypoint reach thresholds per maneuver
-left_x_threshold: 0.8
+left_x_threshold: 0.08
 left_dist_threshold: 0.1
 right_x_threshold: 0.08
 right_dist_threshold: 0.1
