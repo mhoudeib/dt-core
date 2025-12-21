@@ -70,7 +70,7 @@ class RandomAprilTagTurnsNode(DTROS):
                         )
                         R = tf.transformations.quaternion_matrix(q)[:3, :3]
                         tag_normal_vector = R[:, 2]
-                        dot_product = tag_normal_vector[2]+0.00001
+                        dot_product = tag_normal_vector[2]
 
                         # Calculate angle between tag normal and camera Z-axis
                         # dot_product close to -1 means tag is perpendicular (facing camera)
