@@ -2,11 +2,14 @@
 import json
 import numpy as np
 import rospy
-from duckietown_msgs.msg import BoolStamped, \
-    TurnIDandType, \
-    WheelEncoderStamped, \
-    Twist2DStamped, \
-    StopLineReading
+from duckietown_msgs.msg import (BoolStamped,
+    TurnIDandType,
+    WheelEncoderStamped,
+    Twist2DStamped,
+    StopLineReading,
+    LEDPattern,
+    FSMState
+    )
 
 
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
@@ -68,6 +71,13 @@ class UnicornIntersectionNode(DTROS):
         self.sub_encoder_left = message_filters.Subscriber("~left_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_encoder_right = message_filters.Subscriber("~right_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_stop_line_reading = rospy.Subscriber("~stop_line_reading", StopLineReading, self.cbStopLineReading)
+        self.sub_fsm_node_mode = rospy.Subscriber(
+            name='fsm_node/mode',   # The full, resolved topic name
+            data_class=FSMState,     # The message type it expects to receive
+            callback=self.onFSMStateChange, 
+            queue_size=1
+        )
+
 
         ## Publisher
         self.pub_int_done = rospy.Publisher("~intersection_done", BoolStamped, queue_size=1)
@@ -83,6 +93,9 @@ class UnicornIntersectionNode(DTROS):
             "~debug/trajectory/compressed",
             CompressedImage,
             queue_size=1,
+        )
+        self.pub_leds = rospy.Publisher(
+            "~led_pattern", LEDPattern, queue_size=1, dt_topic_type=TopicType.DRIVER
         )
 
         self.ts_encoders = message_filters.ApproximateTimeSynchronizer(
@@ -100,6 +113,24 @@ class UnicornIntersectionNode(DTROS):
         self.reset_odometry()
 
         self.alpha = 0.0
+
+        #Led protocol
+        self.direction_colors = {
+            0: 'cyan',   # Gauche
+            1: 'yellow', # En face
+            2: 'pink'    # Droite
+        }
+
+        self.priority_colors = {
+            1: 'red',
+            2: 'blue',
+            3: 'purple',
+            4: 'white'
+        }
+
+        #Intersection planning mannagement variables
+        self.priority_level = 0
+        self.negotiation_end = False
 
         self.log("Initialialized unicorn intersection node")
 
@@ -137,20 +168,23 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo("[unicorn_intersection_node] We have what we need, calculating reference trajectory")
             self.reference_trajectory = self.calculate_goal_trajectory()
             rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
-            car_control_msg = Twist2DStamped()
-            car_control_msg.header.stamp = rospy.Time.now()
-            car_control_msg.header.seq = 0
-            car_control_msg.v = 0
-            car_control_msg.omega = 0
-            self.car_cmd.publish(car_control_msg)
-            #TODO implement a delay with respect to the node frequency
-            rospy.loginfo(f"[unicorn_intersection_node] On marque le stop")
-            self.internal_state = "EXECUTING"
+            self.intersection_planning()
+            if self.negotiation_end and self.internal_state != "EXECUTING":
+                car_control_msg = Twist2DStamped()
+                car_control_msg.header.stamp = rospy.Time.now()
+                car_control_msg.header.seq = 0
+                car_control_msg.v = 0
+                car_control_msg.omega = 0
+                self.car_cmd.publish(car_control_msg)
+                rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
+                self.internal_state = "EXECUTING"
         else:
+            self.intersection_planning()
             rospy.loginfo(f"[unicorn_intersection_node] We don't have what we need yet: "
                       f"stop_line received: {self.stop_line_pose_received} " 
                       f"turn_type_received: {self.turn_type_received} "
                       f"internal_state:{self.internal_state} ")
+            
 
     # Calculate the pose that we want to navigate to relative to where we are. If we are using
     # the stop line pose then we need to calculate the stop line relative to the robot, and then the
@@ -670,10 +704,14 @@ class UnicornIntersectionNode(DTROS):
         self.car_cmd.publish(car_control_msg)
 
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
+            if self.iter_ == 0:
+                self.update_leds(['yellow', 'yellow', 'yellow', 'yellow', 'yellow']) #LED message to broadcast intersection navigation in progress
             self.iter_ += 1
             self.publish_trajectory_debug_image(self.last_waypoints, self.last_directions)
             rospy.loginfo(f"[{self.node_name}] Published new trajectory debug image with {self.iter_}/{self.num_waypoints} waypoints")
+            
             if self.iter_ == self.num_waypoints:
+                self.update_leds(['green', 'green', 'green', 'green', 'green']) #LED message to broadcast intersection navigation complete
                 self.internal_state = "READY"
                 self.stop_line_pose_received = False
                 self.turn_type_received = False
@@ -682,10 +720,9 @@ class UnicornIntersectionNode(DTROS):
                 msg_done.data = True
                 self.pub_int_done.publish(msg_done)
                 self.reset_odometry()
+                self.priority_level = 0
+                self.negotiation_end = False
                 rospy.loginfo("[unicorn intersection node] intersection navigation complete")
-
-
-
 
     @staticmethod
     def dictionary_pose_to_geometry(dict_param):
@@ -702,6 +739,7 @@ class UnicornIntersectionNode(DTROS):
         self.turn_type = msg.turn_type
         self.turn_type_received = True
         rospy.loginfo(f"[unicorn_intersection_node] Received turn type: {self.turn_type} ")
+
         self.check_if_go()
 
     def setupParams(self):
@@ -822,6 +860,72 @@ class UnicornIntersectionNode(DTROS):
                 return True
 
             return False
+        
+    def update_leds(self, color_list, frequency=0.0):
+        pattern_msg = LEDPattern()
+        # We assign the list of 5 colors
+        pattern_msg.color_list = color_list 
+        pattern_msg.frequency = frequency
+        # We activate all the leds (no flickering by default)
+        pattern_msg.color_mask = [1, 1, 1, 1, 1]
+        pattern_msg.frequency_mask = [0, 0, 0, 0, 0]
+        
+        self.pub_leds.publish(pattern_msg)
+
+    def get_led_pattern(self, priority_level, direction_index, is_ready=False):
+        """
+        priority_level: int (1-4)
+        direction_index: int (0-2)
+        is_ready: bool (If True, the right LED turns green to confirm the start)
+        """
+        # 1. Priority color (LED 0 - Left front)
+        priority_color = self.priority_colors.get(priority_level, 'white')
+
+        # 2. Direction color (LED 4 - Right front)
+        if is_ready:
+            direction_color = 'green'
+        else:
+            direction_color = self.direction_colors.get(direction_index, 'white')
+
+        # 3. Compose the pattern [FL, RL, TOP, RR, FR]
+        pattern = [
+            priority_color,  # Index 0: Front Left
+            'switchedoff',   # Index 1: Rear Left
+            'switchedoff',   # Index 2: Top
+            'switchedoff',   # Index 3: Rear Right
+            direction_color  # Index 4: Front Right
+        ]
+        
+        return pattern
+    
+    def intersection_planning(self):
+        if self.priority_level == 0:
+            self.priority_level = self.get_priority()
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
+            self.update_leds(Led_pattern)
+            rospy.loginfo(f"[unicorn_intersection_node] Set priority to: {self.priority_level} ")
+        
+        if(self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
+            #TODO generate the intersection scenario
+            rospy.Duration(1.0)#emulate the time of scenario computing
+            rospy.loginfo(f"[unicorn_intersection_node] Intersection scenario ready")
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type, is_ready=True)
+            self.update_leds(Led_pattern)
+            while self.negotiation_end != True:
+                #TODO control the start posibility according to scenario
+                rospy.Duration(1.0)#emulate the time of control
+                self.negotiation_end = True
+
+    def get_priority(self):
+        """
+        Get the priority of the vehicule by counting the number of duckiebot in the intersection
+        
+        :param self: Description
+        """
+        #TODO implement a way to count vehicules in the intersection
+        prio = 1
+        return prio
 
 if __name__ == "__main__":
     unicorn_intersection_node = UnicornIntersectionNode(node_name="unicorn_intersection_node")

@@ -64,9 +64,9 @@ class RandomAprilTagTurnsNode(DTROS):
                         )
                         R = tf.transformations.quaternion_matrix(q)[:3, :3]
                         tag_normal_vector = R[:, 2]
-                        dot_product = tag_normal_vector[2]+0.00001
+                        dot_product = tag_normal_vector[2]
 
-                        if distance/dot_product < dis_min:
+                        if distance < dis_min and dot_product >= 0.707:
                             dis_min = distance
                             idx_min = idx
 
