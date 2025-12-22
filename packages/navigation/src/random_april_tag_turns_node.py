@@ -24,6 +24,12 @@ class RandomAprilTagTurnsNode(DTROS):
         self.turn_type = -1
         rospy.loginfo(f"[{self.node_name}] Initializing.")
 
+        # Setup parameters
+        self.dis_max = self.setupParameter("~dis_max", 1.0)
+        self.angle_min = self.setupParameter("~angle_min", 90)
+        self.angle_max = self.setupParameter("~angle_max", 270)
+        self.horizontal_angle_threshold = self.setupParameter("~horizontal_angle_threshold", -60)
+
         # Setup publishers
         self.pub_turn_type = rospy.Publisher("~turn_type", Int16, queue_size=1, latch=True)
         self.pub_id_and_type = rospy.Publisher("~turn_id_and_type", TurnIDandType, queue_size=1, latch=True)
@@ -65,6 +71,36 @@ class RandomAprilTagTurnsNode(DTROS):
                         R = tf.transformations.quaternion_matrix(q)[:3, :3]
                         tag_normal_vector = R[:, 2]
                         dot_product = tag_normal_vector[2]+0.00001
+
+                        # Calculate angle between tag normal and camera Z-axis
+                        # dot_product close to -1 means tag is perpendicular (facing camera)
+                        # dot_product close to 0 means tag is at 90 degrees (sideways)
+                        angle_rad = numpy.arccos(numpy.clip(dot_product, -1.0, 1.0))
+                        angle_deg = numpy.degrees(angle_rad)
+
+                        # Calculate horizontal viewing angle (left/right position in camera view)
+                        # pos.x is forward distance, pos.y is lateral offset
+                        # Horizontal angle: negative = right, positive = left
+                        horizontal_angle = numpy.degrees(numpy.arctan2(pos.y, pos.x))
+
+                        rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] turn type: {taginfo.traffic_sign_type}; angle: {angle_deg:.1f} deg; distance: {distance:.3f}; horizontal: {horizontal_angle:.1f} deg")
+
+                        # Ignore tags that are more than 45 degrees from perpendicular
+                        # We want tags facing roughly towards the camera (angle close to 180 degrees)
+                        if angle_deg < self.angle_min or angle_deg > self.angle_max:
+                            rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag at {angle_deg:.1f} degrees (not perpendicular, outside {self.angle_min}-{self.angle_max} range)")
+                            continue
+
+                        # Ignore tags on the left side of camera view
+                        # Horizontal viewing angle threshold is configurable
+                        # This is robust regardless of robot position
+                        if horizontal_angle < self.horizontal_angle_threshold:
+                            rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag at horizontal angle {horizontal_angle:.1f} degrees (< {self.horizontal_angle_threshold} threshold)")
+                            continue
+
+                        if distance > self.dis_max:
+                            rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag at distance={distance:.3f} (too far)")
+                            continue
 
                         if distance/dot_product < dis_min:
                             dis_min = distance

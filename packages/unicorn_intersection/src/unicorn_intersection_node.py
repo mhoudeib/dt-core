@@ -91,8 +91,8 @@ class UnicornIntersectionNode(DTROS):
         self.ts_encoders.registerCallback(self.cb_ts_encoders)
 
         ## update Parameters timer
-        self.params_update = rospy.Timer(rospy.Duration.from_sec(1.0), self.updateParams)
-        self.debug_viz_timer = rospy.Timer(rospy.Duration.from_sec(1.0), self.publish_debug_timer_cb)
+        # self.params_update = rospy.Timer(rospy.Duration.from_sec(1.0), self.updateParams)
+        # self.debug_viz_timer = rospy.Timer(rospy.Duration.from_sec(1.0), self.publish_debug_timer_cb)
 
         ## Deadreckoning 
 
@@ -102,6 +102,25 @@ class UnicornIntersectionNode(DTROS):
         self.alpha = 0.0
 
         self.log("Initialialized unicorn intersection node")
+
+    def onFSMStateChange(self, msg):
+        """
+        Callback for FSM state changes. Reset odometry and state when switching to joystick control.
+        This is automatically called by DTROS when fsm_controlled=True.
+        """
+        new_state = msg.state
+        rospy.loginfo(f"[{self.node_name}] FSM state changed to: {new_state}")
+
+        # Reset odometry and state when switching to joystick control
+        if new_state == "NORMAL_JOYSTICK_CONTROL":
+            rospy.loginfo(f"[{self.node_name}] Switching to joystick control - resetting state")
+            self.reset_odometry()
+            # Reset intersection state so it can recalculate trajectory when returning to autopilot
+            self.internal_state = "READY"
+            self.stop_line_pose_received = False
+            self.turn_type_received = False
+            self.g_stop_pose_plan = None
+            self.stop_frame_robot_ref = None
 
     def cbStopLineReading(self, msg):
         if self.stop_line_pose_received:
@@ -176,13 +195,7 @@ class UnicornIntersectionNode(DTROS):
             waypoints.extend(w1 + w2)
             directions.extend(d1 + d2)
         else:
-            if self.turn_type == 0:
-                num_wp = self.left_num_waypoints
-            elif self.turn_type == 1:
-                num_wp = self.straight_num_waypoints
-            else:
-                num_wp = self.right_num_waypoints
-            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, num_wp)
+            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, self.num_waypoints)
             waypoints.extend(w)
             directions.extend(d)
 
@@ -192,7 +205,7 @@ class UnicornIntersectionNode(DTROS):
         for wp, dir in zip(waypoints, directions):
             wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
             wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
-            pos, heading = g.translation_angle_from_SE2(wp_odom)
+            pos, _ = g.translation_angle_from_SE2(wp_odom)
             waypoints_odom.append(pos)
 
         if self.visualization:
@@ -202,7 +215,7 @@ class UnicornIntersectionNode(DTROS):
         else:
             self.last_waypoints = []
             self.last_directions = []
-        
+
         self.publish_path_and_markers(waypoints, directions, g_stop_pose)
         return waypoints_odom  # Return odometry frame waypoints!
 
@@ -646,12 +659,14 @@ class UnicornIntersectionNode(DTROS):
         # Add commands to car message
         gainV = 0.75
         wayPoint = self.reference_trajectory[self.iter_]
-        car_control_msg.v = min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y))
+        car_control_msg.v = max(0.15, min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y)))
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
             self.iter_ += 1
+            rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_-1}, moving to waypoint {self.iter_}/{self.num_waypoints}")
+
             if self.iter_ == self.num_waypoints:
                 self.internal_state = "READY"
                 self.stop_line_pose_received = False

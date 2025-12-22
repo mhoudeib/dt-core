@@ -10,6 +10,7 @@
   `dts devel build -H vggquack`  
   `dts devel run -H vggquack -M -L single_robot_indefinite_navigation`
 - Teleop (optional): `dts duckiebot keyboard_control vggquack`
+- Image viewer (optional): `dts duckiebot image_viewer vggquack`
 - GUI/RViz tools: `dts gui vggquack`  
   View the debug image: `rosrun image_view image_view image:=/vggquack/unicorn_intersection_node/debug/trajectory _image_transport:=compressed`
 
