@@ -821,6 +821,7 @@ class UnicornIntersectionNode(DTROS):
         else:
             dist = np.sqrt(((current_point[0]-self.alpha) - target_point[0])**2 + ((current_point[1]-self.alpha) - target_point[1])**2 )
 
+            #TODO: add a check to see if the robot has passed the target point in the direction of travel (abs missleads when the robot is behind the target point)
             if (abs(dist_x[0,0])) > threshold_x or (dist) < threshold:
                 return True
 
