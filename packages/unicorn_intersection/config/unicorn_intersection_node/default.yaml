@@ -1,7 +1,7 @@
 use_stop_pose: False
 left_num_waypoints: 6
 right_num_waypoints: 4
-straight_num_waypoints: 3
+straight_num_waypoints: 4
 visualization: True
 speed: 0.2
 
@@ -44,7 +44,7 @@ left_x_threshold: 0.18
 left_dist_threshold: 0.08
 right_x_threshold: 0.15
 right_dist_threshold: 0.08
-straight_x_threshold: 0.02
-straight_dist_threshold: 0.02
+straight_x_threshold: 0.08
+straight_dist_threshold: 0.08
 
 debug_dir: -1
