@@ -147,6 +147,8 @@ class UnicornIntersectionNode(DTROS):
         #Intersection planning mannagement variables
         self.priority_level = 0
         self.negotiation_end = False
+        self.led_priority_set = False
+        self.led_ready_set = False
 
         self.log("Initialialized unicorn intersection node")
 
@@ -168,6 +170,10 @@ class UnicornIntersectionNode(DTROS):
             self.turn_type_received = False
             self.g_stop_pose_plan = None
             self.stop_frame_robot_ref = None
+            self.priority_level = 0
+            self.negotiation_end = False
+            self.led_priority_set = False
+            self.led_ready_set = False
             self.current_led_pattern = None
             self.current_led_pattern_type = None
         elif new_state == "INTERSECTION_CONTROL":
@@ -638,6 +644,15 @@ class UnicornIntersectionNode(DTROS):
         self.ticks_per_meter = 656.0
         self.wheelbase = 0.108
         self.iter_ = 0
+        self.reference_trajectory = []
+        self.last_waypoints = []
+        self.last_directions = []
+        self.plan_pose_odom = None
+        self.stop_frame_robot_ref = None
+        self.turn_type = -1
+        self.stop_line_pose = Pose2D()
+        self.g_stop_pose_plan = None
+        self.num_waypoints = None
         self.final_state = 0
 
     def cb_ts_encoders(self, left_encoder, right_encoder):
@@ -726,7 +741,12 @@ class UnicornIntersectionNode(DTROS):
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 
-        if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
+        # Get previous waypoint for along-track/cross-track check
+        prev_point = None
+        if self.iter_ > 0:
+            prev_point = self.reference_trajectory[self.iter_ - 1]
+        
+        if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_], prev_point ):
             if self.iter_ == 0:
                 # Use predefined YELLOW pattern when starting navigation
                 self.set_led_pattern("YELLOW")
@@ -751,6 +771,8 @@ class UnicornIntersectionNode(DTROS):
                 self.reset_odometry()
                 self.priority_level = 0
                 self.negotiation_end = False
+                self.led_priority_set = False
+                self.led_ready_set = False
                 self.current_led_pattern = None
                 self.current_led_pattern_type = None
                 rospy.loginfo("[unicorn intersection node] intersection navigation complete")
@@ -836,7 +858,7 @@ class UnicornIntersectionNode(DTROS):
 
         return omega
 
-    def check_point(self, current_point, target_point):
+    def check_point(self, current_point, target_point, prev_point=None):
         # Maneuver-specific thresholds to avoid skipping waypoints
         if self.turn_type == 0:  # left
             threshold = self.left_dist_threshold
@@ -847,20 +869,64 @@ class UnicornIntersectionNode(DTROS):
         else:  # right
             threshold = self.right_dist_threshold
             threshold_x = self.right_x_threshold
-        dist_x = np.zeros((1,2))
-        dist_x[0, 0] = (current_point[0] - self.alpha) - target_point[0]
-        dist_x[0, 1] = (current_point[1]) - target_point[1]
+        
+        # Apply alpha offset to current point
+        current_x = current_point[0] - self.alpha
+        current_y = current_point[1]
+        
         if self.iter_ == (self.num_waypoints - 1):
-            if abs(dist_x[0, 1]) < threshold_x:
+            # Last waypoint: just check if close enough
+            dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
+            if dist < threshold:
                 return True
-
+            if abs(current_x - target_point[0]) < threshold_x:
+                return True
             return False
 
         else:
-            dist = np.sqrt(((current_point[0]-self.alpha) - target_point[0])**2 + ((current_point[1]-self.alpha) - target_point[1])**2 )
-
-            #TODO: add a check to see if the robot has passed the target point in the direction of travel (abs missleads when the robot is behind the target point)
-            if (abs(dist_x[0,0])) > threshold_x or (dist) < threshold:
+            # Distance to target waypoint
+            dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
+            
+            # If close enough to waypoint, advance
+            if dist < threshold:
+                return True
+            
+            # If no previous point, fall back to distance check only
+            if prev_point is None:
+                return False
+            
+            # Along-track/cross-track decomposition
+            # Segment direction from prev_point to target_point
+            seg_x = target_point[0] - prev_point[0]
+            seg_y = target_point[1] - prev_point[1]
+            seg_length = np.sqrt(seg_x**2 + seg_y**2)
+            
+            # Handle degenerate segment
+            if seg_length < 1e-6:
+                return False
+            
+            # Unit tangent along segment
+            t_x = seg_x / seg_length
+            t_y = seg_y / seg_length
+            
+            # Vector from prev waypoint to robot
+            v_x = current_x - prev_point[0]
+            v_y = current_y - prev_point[1]
+            
+            # Along-track progress (signed distance along segment direction)
+            s = v_x * t_x + v_y * t_y
+            
+            # Cross-track error (lateral distance to segment line)
+            cross_track_x = v_x - s * t_x
+            cross_track_y = v_y - s * t_y
+            e = np.sqrt(cross_track_x**2 + cross_track_y**2)
+            
+            # Advance if passed the waypoint along travel direction
+            if s >= seg_length:
+                return True
+            
+            # Advance if close to segment line and near the end (helps when cutting corners)
+            if e < threshold_x and s >= 0.90 * seg_length:
                 return True
 
             return False
@@ -965,17 +1031,20 @@ class UnicornIntersectionNode(DTROS):
     def intersection_planning(self):
         if self.priority_level == 0:
             self.priority_level = self.get_priority()
-            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
-            self.update_leds(Led_pattern)
-            rospy.loginfo(f"[unicorn_intersection_node] Set priority to: {self.priority_level} ")
+            if not self.led_priority_set:
+                Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
+                self.update_leds(Led_pattern)
+                self.led_priority_set = True
+                rospy.loginfo(f"[unicorn_intersection_node] Set priority to: {self.priority_level} ")
         
         if(self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
-            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
             #TODO generate the intersection scenario
             rospy.Duration(1.0)#emulate the time of scenario computing
             rospy.loginfo(f"[unicorn_intersection_node] Intersection scenario ready")
-            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type, is_ready=True)
-            self.update_leds(Led_pattern)
+            if not self.led_ready_set:
+                Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type, is_ready=True)
+                self.update_leds(Led_pattern)
+                self.led_ready_set = True
             while self.negotiation_end != True:
                 #TODO control the start posibility according to scenario
                 rospy.Duration(1.0)#emulate the time of control

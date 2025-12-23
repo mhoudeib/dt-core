@@ -40,11 +40,11 @@ use_left_turn_via_point: True
 stop_line_offset: 0.0
 
 # Waypoint reach thresholds per maneuver
-left_x_threshold: 0.08
-left_dist_threshold: 0.1
-right_x_threshold: 0.08
-right_dist_threshold: 0.1
-straight_x_threshold: 0.08
-straight_dist_threshold: 0.1
+left_x_threshold: 0.18
+left_dist_threshold: 0.08
+right_x_threshold: 0.15
+right_dist_threshold: 0.08
+straight_x_threshold: 0.02
+straight_dist_threshold: 0.02
 
 debug_dir: -1
