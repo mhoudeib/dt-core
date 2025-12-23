@@ -10,6 +10,8 @@ from duckietown_msgs.msg import (BoolStamped,
     LEDPattern,
     FSMState
     )
+from duckietown_msgs.srv import ChangePattern, SetCustomLEDPattern
+from std_msgs.msg import String
 
 
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
@@ -94,9 +96,23 @@ class UnicornIntersectionNode(DTROS):
             CompressedImage,
             queue_size=1,
         )
-        self.pub_leds = rospy.Publisher(
-            "~led_pattern", LEDPattern, queue_size=1, dt_topic_type=TopicType.DRIVER
-        )
+
+        # LED service proxies - wait for services to be available
+        try:
+            rospy.wait_for_service('led_emitter_node/set_pattern', timeout=5.0)
+            rospy.wait_for_service('led_emitter_node/set_custom_pattern', timeout=5.0)
+            self.led_pattern_service = rospy.ServiceProxy('led_emitter_node/set_pattern', ChangePattern)
+            self.led_custom_pattern_service = rospy.ServiceProxy('led_emitter_node/set_custom_pattern', SetCustomLEDPattern)
+            rospy.loginfo(f"[{self.node_name}] LED services connected")
+        except rospy.ROSException as e:
+            rospy.logwarn(f"[{self.node_name}] LED services not available: {e}. LEDs may not work.")
+            self.led_pattern_service = None
+            self.led_custom_pattern_service = None
+
+        # Store current LED pattern state for re-application after FSM changes
+        self.current_led_pattern = None
+        self.current_led_pattern_type = None  # 'predefined' or 'custom'
+        self.led_pattern_timer = None  # Timer to periodically re-apply LED pattern
 
         self.ts_encoders = message_filters.ApproximateTimeSynchronizer(
             [self.sub_encoder_left, self.sub_encoder_right], 1, 1
@@ -152,6 +168,19 @@ class UnicornIntersectionNode(DTROS):
             self.turn_type_received = False
             self.g_stop_pose_plan = None
             self.stop_frame_robot_ref = None
+            self.current_led_pattern = None
+            self.current_led_pattern_type = None
+        elif new_state == "INTERSECTION_CONTROL":
+            # Re-apply LED pattern when entering intersection control
+            if self.current_led_pattern is not None:
+                rospy.loginfo(f"[{self.node_name}] Re-applying LED pattern after FSM state change")
+                rospy.Timer(rospy.Duration(0.3), lambda event: self._reapply_led_pattern(), oneshot=True)
+            # Start periodic re-application timer during execution
+            if self.internal_state == "EXECUTING" and self.current_led_pattern is not None:
+                self._start_led_pattern_timer()
+        elif new_state != "INTERSECTION_CONTROL":
+            # Stop LED pattern timer when leaving intersection control
+            self._stop_led_pattern_timer()
 
     def cbStopLineReading(self, msg):
         if self.stop_line_pose_received:
@@ -699,12 +728,19 @@ class UnicornIntersectionNode(DTROS):
 
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
             if self.iter_ == 0:
-                self.update_leds(['yellow', 'yellow', 'yellow', 'yellow', 'yellow']) #LED message to broadcast intersection navigation in progress
+                # Use predefined YELLOW pattern when starting navigation
+                self.set_led_pattern("YELLOW")
+                # Start periodic re-application timer during execution
+                if self.internal_state == "EXECUTING":
+                    self._start_led_pattern_timer()
             self.iter_ += 1
             rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_-1}, moving to waypoint {self.iter_}/{self.num_waypoints}")
 
             if self.iter_ == self.num_waypoints:
-                self.update_leds(['green', 'green', 'green', 'green', 'green']) #LED message to broadcast intersection navigation complete
+                # Stop LED pattern timer
+                self._stop_led_pattern_timer()
+                # Use predefined GREEN pattern when navigation complete
+                self.set_led_pattern("GREEN")
                 self.internal_state = "READY"
                 self.stop_line_pose_received = False
                 self.turn_type_received = False
@@ -715,6 +751,8 @@ class UnicornIntersectionNode(DTROS):
                 self.reset_odometry()
                 self.priority_level = 0
                 self.negotiation_end = False
+                self.current_led_pattern = None
+                self.current_led_pattern_type = None
                 rospy.loginfo("[unicorn intersection node] intersection navigation complete")
 
     @staticmethod
@@ -827,7 +865,39 @@ class UnicornIntersectionNode(DTROS):
 
             return False
 
+    def set_led_pattern(self, pattern_name):
+        """
+        Set a predefined LED pattern by name (e.g., "BLUE", "GREEN", "YELLOW", "RED").
+        
+        Args:
+            pattern_name: String name of the predefined pattern
+        """
+        if self.led_pattern_service is None:
+            rospy.logwarn(f"[{self.node_name}] LED pattern service not available, cannot set pattern: {pattern_name}")
+            return
+        
+        pattern_msg = String()
+        pattern_msg.data = pattern_name
+        try:
+            self.led_pattern_service(pattern_name=pattern_msg)
+            self.current_led_pattern = pattern_name
+            self.current_led_pattern_type = 'predefined'
+            rospy.loginfo(f"[{self.node_name}] Set LED pattern to: {pattern_name}")
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[{self.node_name}] Failed to set LED pattern {pattern_name}: {e}")
+
     def update_leds(self, color_list, frequency=0.0):
+        """
+        Set a custom LED pattern using a list of colors.
+        
+        Args:
+            color_list: List of 5 color names (e.g., ['red', 'blue', 'white', 'green', 'yellow'])
+            frequency: Blinking frequency in Hz (0.0 for solid)
+        """
+        if self.led_custom_pattern_service is None:
+            rospy.logwarn(f"[{self.node_name}] LED custom pattern service not available, cannot set custom pattern")
+            return
+        
         pattern_msg = LEDPattern()
         # We assign the list of 5 colors
         pattern_msg.color_list = color_list 
@@ -836,7 +906,35 @@ class UnicornIntersectionNode(DTROS):
         pattern_msg.color_mask = [1, 1, 1, 1, 1]
         pattern_msg.frequency_mask = [0, 0, 0, 0, 0]
         
-        self.pub_leds.publish(pattern_msg)
+        try:
+            self.led_custom_pattern_service(pattern=pattern_msg)
+            self.current_led_pattern = (color_list, frequency)
+            self.current_led_pattern_type = 'custom'
+            rospy.loginfo(f"[{self.node_name}] Set custom LED pattern: {color_list}")
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[{self.node_name}] Failed to set custom LED pattern: {e}")
+
+    def _reapply_led_pattern(self, event=None):
+        """Re-apply the current LED pattern (used after FSM state changes or timer callbacks)"""
+        if self.current_led_pattern is None:
+            return
+        
+        if self.current_led_pattern_type == 'predefined':
+            self.set_led_pattern(self.current_led_pattern)
+        elif self.current_led_pattern_type == 'custom':
+            color_list, frequency = self.current_led_pattern
+            self.update_leds(color_list, frequency)
+
+    def _start_led_pattern_timer(self):
+        """Start a timer to periodically re-apply LED pattern during execution"""
+        self._stop_led_pattern_timer()  # Stop any existing timer
+        self.led_pattern_timer = rospy.Timer(rospy.Duration(0.5), self._reapply_led_pattern)
+
+    def _stop_led_pattern_timer(self):
+        """Stop the LED pattern re-application timer"""
+        if self.led_pattern_timer is not None:
+            self.led_pattern_timer.shutdown()
+            self.led_pattern_timer = None
 
     def get_led_pattern(self, priority_level, direction_index, is_ready=False):
         """

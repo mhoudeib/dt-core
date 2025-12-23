@@ -1,2 +1,5 @@
 # default parameters for navigation/random_april_tag_turns_node
-self.dis_max: 0.7
+dis_max: 0.7
+angle_min: 90
+angle_max: 270
+horizontal_angle_threshold: -77
