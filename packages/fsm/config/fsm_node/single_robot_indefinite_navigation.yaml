@@ -70,6 +70,7 @@ states:
       - stop_line_filter_node
       - ground_projection_node
       - anti_instagram
+      - led_emitter_node
 #      - apriltag_detector_node
 #      - apriltag_postprocessing_node
     lights: "GREEN"
@@ -85,6 +86,7 @@ states:
       - lane_controller_node
       - stop_line_filter_node
       - unicorn_intersection_node
+      - led_emitter_node
     lights: "RED"
 
   DETECT_INTERSECTION_TYPE:
@@ -97,6 +99,7 @@ states:
       - apriltag_postprocessing_node
       - intersection_type_detector_node
       - unicorn_intersection_node
+      - led_emitter_node
     lights: "YELLOW"
 
   STOP_SIGN_INTERSECTION:
@@ -108,6 +111,7 @@ states:
       - apriltag_postprocessing_node
       - random_april_tag_turns_node
       - unicorn_intersection_node
+      - led_emitter_node
     lights: "WHITE"
 
   TRAFFIC_LIGHT_INTERSECTION:
@@ -119,6 +123,7 @@ states:
       - lane_controller_node
       - led_detector_node
       - coordinator_node
+      - led_emitter_node
     lights: "WHITE"
 
 
@@ -131,3 +136,4 @@ states:
       - lane_controller_node
       - unicorn_intersection_node
       - random_april_tag_turns_node
+      - led_emitter_node
