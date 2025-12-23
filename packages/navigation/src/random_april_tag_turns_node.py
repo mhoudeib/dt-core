@@ -87,7 +87,7 @@ class RandomAprilTagTurnsNode(DTROS):
 
                         # Ignore tags that are more than 45 degrees from perpendicular
                         # We want tags facing roughly towards the camera (angle close to 180 degrees)
-                        if angle_deg < self.angle_min or angle_deg > self.angle_max:
+                        if angle_deg < self.angle_min or angle_deg > self.angle_max or abs(dot_product) < 0.707:
                             rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag at {angle_deg:.1f} degrees (not perpendicular, outside {self.angle_min}-{self.angle_max} range)")
                             continue
 
@@ -102,7 +102,7 @@ class RandomAprilTagTurnsNode(DTROS):
                             rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag at distance={distance:.3f} (too far)")
                             continue
 
-                        if distance/dot_product < dis_min:
+                        if distance < dis_min:
                             dis_min = distance
                             idx_min = idx
 
