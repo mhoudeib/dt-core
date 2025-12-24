@@ -51,6 +51,8 @@ class StopLineFilterNode(DTROS):
         self.min_segs = DTParam("~min_segs", param_type=ParamType.INT)
         self.off_time = DTParam("~off_time", param_type=ParamType.FLOAT)
         self.max_y = DTParam("~max_y", param_type=ParamType.FLOAT)
+        self.stop_pose_smoothing = rospy.get_param("~stop_pose_smoothing", True)
+        self.stop_pose_window = int(rospy.get_param("~stop_pose_window", 3))
 
         ## state vars
         self.lane_pose = LanePose()
@@ -64,6 +66,7 @@ class StopLineFilterNode(DTROS):
         
         # robustness state properties: smoothing & hysteresis
         self._dist_window = deque(maxlen=5) # last 5 distances
+        self._pose_window = deque(maxlen=self.stop_pose_window)
         self._at_stop_line = False
         self._below_count = 0
         self._above_count = 0
@@ -101,6 +104,7 @@ class StopLineFilterNode(DTROS):
         if good_seg_count < self.min_segs.value:
             stop_line_reading_msg.stop_line_detected = False
             self._dist_window.clear()
+            self._pose_window.clear()
             # hysteresis: no detection pushes ustowards not at stop line decision
             # if this condition does not pass, at_stop line stays true
             # and we no longer see the line in this frame, but still consider ourselves at the stop line
@@ -121,6 +125,15 @@ class StopLineFilterNode(DTROS):
             stop_pose.x = - stop_line_x_accumulator / good_seg_count
             stop_pose.y = self.lane_pose.d
             stop_pose.theta = self.lane_pose.phi
+            self._pose_window.append(stop_pose)
+            if self.stop_pose_smoothing and len(self._pose_window) > 0:
+                xs = [p.x for p in self._pose_window]
+                ys = [p.y for p in self._pose_window]
+                s = sum(np.sin(p.theta) for p in self._pose_window)
+                c = sum(np.cos(p.theta) for p in self._pose_window)
+                stop_pose.x = float(sum(xs) / len(xs))
+                stop_pose.y = float(sum(ys) / len(ys))
+                stop_pose.theta = float(np.arctan2(s, c))
             stop_line_reading_msg.stop_pose = stop_pose
 
             raw_dist = -stop_pose.x  # positive means stop line isin front of robot, negative means behind

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+from collections import deque
 import numpy as np
 import rospy
 from duckietown_msgs.msg import (BoolStamped,
@@ -58,6 +59,7 @@ class UnicornIntersectionNode(DTROS):
         self.last_directions = []
         self.plan_pose_odom = None
         self.stop_frame_robot_ref = None
+        self.robot_frame_goal_pose = None
 
         ## Internal variables
         self.turn_type = -1
@@ -226,10 +228,14 @@ class UnicornIntersectionNode(DTROS):
     # goal pose relative to the stop line. If not using the stop line then we can use some fixed offset based on the
     # stop line distance? TODO
     def calculate_goal_trajectory(self):
+        self.stop_line_pose.theta = 0.0
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
         self.g_stop_pose_plan = g_stop_pose
         self.plan_pose_odom = None
         self.stop_frame_robot_ref = None
+        # odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        rospy.loginfo(f"[{self.node_name}] odom_T_robot: {[self.x, self.y, self.yaw]}")
+        rospy.loginfo(f"[{self.node_name}] stop_line_pose: {self.stop_line_pose.x}, {self.stop_line_pose.y}, {self.stop_line_pose.theta} ")
 
         if self.turn_type == 0:
             canonical_goal_pose = self.goal_poses['left']
@@ -247,35 +253,42 @@ class UnicornIntersectionNode(DTROS):
             rospy.logerr("[unicorn_intersection_node] Something went wrong, invalid turn type")
 
         robot_frame_goal_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), canonical_goal_pose)
+        via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
+        robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), via_pose)
 
         p, d = g.translation_angle_from_SE2(robot_frame_goal_pose)
-        print(f"goal_pose in robot frame: position {p}, angle  {d}")
+        rospy.loginfo(f"[unicorn_intersection_node] goal_pose in robot frame: position {p}, angle  {d}")
+
+        p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
+        rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
+        # Store goal pose in robot frame for visualization
+        self.robot_frame_goal_pose = robot_frame_goal_pose
 
         waypoints = []
         directions = []
 
         if self.turn_type == 0 and self.use_left_turn_via_point:
-            via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
             seg1_count = max(1, self.left_num_waypoints // 2)
             seg2_count = max(1, self.left_num_waypoints - seg1_count)
 
-            w1, d1 = self.interpolate_segment(g_stop_pose, via_pose, seg1_count)
-            w2, d2 = self.interpolate_segment(via_pose, canonical_goal_pose, seg2_count)
+            w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
+            w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
             waypoints.extend(w1 + w2)
             directions.extend(d1 + d2)
         else:
-            w, d = self.interpolate_segment(g_stop_pose, canonical_goal_pose, self.num_waypoints)
+            w, d = self.interpolate_segment(g_stop_pose, robot_frame_goal_pose, self.num_waypoints)
             waypoints.extend(w)
             directions.extend(d)
 
         # Transform waypoints to odometry frame
-        odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
-        waypoints_odom = []
-        for wp, dir in zip(waypoints, directions):
-            wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
-            wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
-            pos, _ = g.translation_angle_from_SE2(wp_odom)
-            waypoints_odom.append(pos)
+        # odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        # waypoints_odom = []
+        # for wp, dir in zip(waypoints, directions):
+        #     wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
+        #     wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
+        #     pos, _ = g.translation_angle_from_SE2(wp_odom)
+        #     waypoints_odom.append(pos)
+        # rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
 
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
@@ -286,7 +299,7 @@ class UnicornIntersectionNode(DTROS):
             self.last_directions = []
 
         self.publish_path_and_markers(waypoints, directions, g_stop_pose)
-        return waypoints_odom  # Return odometry frame waypoints!
+        return waypoints  # Return waypoints!
 
     def interpolate_segment(self, start_pose, end_pose, num_points):
         """Interpolate SE(2) trajectory between two poses."""
@@ -299,6 +312,9 @@ class UnicornIntersectionNode(DTROS):
             rel = g.SE2.group_from_algebra(vel * alpha)
             inter_pose = g.SE2.multiply(start_pose, rel)
             position, direction = g.translation_angle_from_SE2(inter_pose)
+            # Prevent planning behind the stop line: clamp x >= 0 in the stop-line frame
+            if position[0] < 0.0:
+                position = np.array([0.0, position[1]])
             waypoints.append(position)
             directions.append(direction)
         return waypoints, directions
@@ -648,16 +664,8 @@ class UnicornIntersectionNode(DTROS):
         self.ticks_per_meter = 656.0
         self.wheelbase = 0.108
         self.iter_ = 0
-        self.reference_trajectory = []
-        self.last_waypoints = []
-        self.last_directions = []
-        self.plan_pose_odom = None
-        self.stop_frame_robot_ref = None
-        self.turn_type = -1
-        self.stop_line_pose = Pose2D()
-        self.g_stop_pose_plan = None
-        self.num_waypoints = None
         self.final_state = 0
+        rospy.loginfo(f"[{self.node_name}] Odometry reset")
 
     def cb_ts_encoders(self, left_encoder, right_encoder):
         if self.internal_state != "EXECUTING":
@@ -745,6 +753,8 @@ class UnicornIntersectionNode(DTROS):
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 
+        # rospy.loginfo(f"[{self.node_name}] robot position: {self.x}, {self.y}, {self.yaw}")
+
         # Get previous waypoint for along-track/cross-track check
         prev_point = None
         if self.iter_ > 0:
@@ -772,6 +782,9 @@ class UnicornIntersectionNode(DTROS):
                 msg_done = BoolStamped()
                 msg_done.data = True
                 self.pub_int_done.publish(msg_done)
+                rospy.loginfo(f"[{self.node_name}] robot position: {self.x}, {self.y}, {self.yaw}")
+                rospy.loginfo(f"[{self.node_name}] goal pose in robot frame: {self.robot_frame_goal_pose}")
+                rospy.loginfo(f"[{self.node_name}] reference trajectory: {self.reference_trajectory}")
                 self.reset_odometry()
                 self.priority_level = 0
                 self.negotiation_end = False
@@ -876,19 +889,51 @@ class UnicornIntersectionNode(DTROS):
         current_y = current_point[1]
         
         if self.iter_ == (self.num_waypoints - 1):
-            # Last waypoint: just check if close enough
+            # Last waypoint: check if close enough or if passed it along travel direction
             dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
             if dist < threshold:
+                rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, dist: {dist}, threshold: {threshold}")
                 return True
-            if abs(current_x - target_point[0]) < threshold_x:
-                return True
+            
+            # Check if robot has passed the waypoint along travel direction (prevents oscillation)
+            if prev_point is not None:
+                # Segment direction from prev_point to target_point
+                seg_x = target_point[0] - prev_point[0]
+                seg_y = target_point[1] - prev_point[1]
+                seg_length = np.sqrt(seg_x**2 + seg_y**2)
+                
+                if seg_length >= 1e-6:
+                    # Unit tangent along segment
+                    t_x = seg_x / seg_length
+                    t_y = seg_y / seg_length
+                    
+                    # Vector from prev waypoint to robot
+                    v_x = current_x - prev_point[0]
+                    v_y = current_y - prev_point[1]
+                    
+                    # Along-track progress (signed distance along segment direction)
+                    s = v_x * t_x + v_y * t_y
+                    
+                    # Advance if passed the waypoint along travel direction
+                    if s >= seg_length:
+                        rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, s: {s}, seg_length: {seg_length}")
+                        return True
+                    # print -np.sign(target_point[0] - self.reference_trajectory[0][0]) * (current_x - target_point[0]) > threshold_x
+                    direction = np.sign(target_point[0] - self.reference_trajectory[0][0])  # +1 if goal x ahead, -1 if behind
+                    signed_overrun = direction * (current_x - target_point[0])
+
+                    rospy.loginfo(f"[{self.node_name}] dist passed: {signed_overrun}")
+                    if signed_overrun > threshold_x:
+                        rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, overrun_x: {signed_overrun:.3f}, threshold_x: {threshold_x}")
+                        return True
+            
             return False
 
         else:
             # Distance to target waypoint
             dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
 
-            rospy.loginfo(f"[{self.node_name}] dist: {dist}, threshold: {threshold}")
+            # rospy.loginfo(f"[{self.node_name}] dist: {dist}, threshold: {threshold}")
             
             # If close enough to waypoint, advance
             if dist < threshold:
