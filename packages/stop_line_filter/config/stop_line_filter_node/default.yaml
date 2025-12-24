@@ -1,5 +1,5 @@
 stop_distance: 0.12
-min_segs: 6
+min_segs: 5
 off_time: 2
 max_y: 0.2
 # Stop-pose smoothing in stop_line_filter (average pose over recent detections)

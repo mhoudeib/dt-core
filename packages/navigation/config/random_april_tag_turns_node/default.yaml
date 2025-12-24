@@ -2,4 +2,4 @@
 dis_max: 0.7
 angle_min: 90
 angle_max: 270
-horizontal_angle_threshold: -77
+horizontal_angle_threshold: -80
