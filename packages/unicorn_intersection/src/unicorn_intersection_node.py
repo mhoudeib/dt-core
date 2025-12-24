@@ -79,7 +79,7 @@ class UnicornIntersectionNode(DTROS):
         self.sub_encoder_right = message_filters.Subscriber("~right_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_stop_line_reading = rospy.Subscriber("~stop_line_reading", StopLineReading, self.cbStopLineReading)
         # Raw Apriltag detections (AprilTagDetectionArray) from apriltag_detector_node
-        self.sub_apriltags = rospy.Subscriber("~detections", AprilTagDetectionArray, self.cbApriltags, queue_size=1)
+        self.sub_apriltags = rospy.Subscriber("apriltag_detector_node/detections", AprilTagDetectionArray, self.cbApriltags, queue_size=1)
         self.sub_fsm_node_mode = rospy.Subscriber(
             name='fsm_node/mode',   # The full, resolved topic name
             data_class=FSMState,     # The message type it expects to receive
@@ -199,6 +199,8 @@ class UnicornIntersectionNode(DTROS):
         if self.stop_line_pose_received:
             return
 
+        # Accept stop line reading when at_stop_line is True
+        # Note: stop_pose.theta can legitimately be 0.0 if robot is perfectly aligned
         if msg.at_stop_line:
             self.stop_line_pose = msg.stop_pose
             self.stop_line_pose_received = True
@@ -207,12 +209,18 @@ class UnicornIntersectionNode(DTROS):
 
     def check_if_go(self):
         if (self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
-            rospy.loginfo("[unicorn_intersection_node] We have what we need, calculating reference trajectory")
+            rospy.loginfo("[unicorn_intersection_node] We have what we need, preparing for intersection")
+            # Align to AprilTag FIRST before calculating trajectory
+            # This ensures trajectory is computed from a well-aligned pose
+            if self.align_to_apriltag:
+                rospy.loginfo("[unicorn_intersection_node] Aligning to AprilTag before trajectory calculation")
+                self.align_to_apriltag_heading()
+
+            # Now calculate trajectory from the aligned pose
+            rospy.loginfo("[unicorn_intersection_node] Calculating reference trajectory from aligned pose")
             self.reference_trajectory = self.calculate_goal_trajectory()
             rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
-            # Optional pre-alignment to Apriltag for this turn
-            if self.align_to_apriltag:
-                self.align_to_apriltag_heading()
+
             self.intersection_planning()
             if self.negotiation_end and self.internal_state != "EXECUTING":
                 car_control_msg = Twist2DStamped()
@@ -226,7 +234,7 @@ class UnicornIntersectionNode(DTROS):
         else:
             self.intersection_planning()
             rospy.loginfo(f"[unicorn_intersection_node] We don't have what we need yet: "
-                      f"stop_line received: {self.stop_line_pose_received} " 
+                      f"stop_line received: {self.stop_line_pose_received} "
                       f"turn_type_received: {self.turn_type_received} "
                       f"internal_state:{self.internal_state} ")
             
@@ -238,33 +246,188 @@ class UnicornIntersectionNode(DTROS):
         for detection in msg.detections:
             self.apriltag_detections[detection.tag_id] = detection
 
+    def _scan_for_apriltag(self, tag_id):
+        """
+        Scan for an AprilTag by rotating left, then right, then returning to center.
+        Returns the detection if found, None otherwise.
+        """
+        # Store initial yaw
+        initial_yaw = self.yaw
+        rospy.loginfo(f"[{self.node_name}] Starting AprilTag scan. Initial yaw: {initial_yaw:.3f} rad ({np.degrees(initial_yaw):.1f} deg)")
+
+        # Function to rotate to a target angle
+        def rotate_to_angle(target_yaw, timeout=3.0):
+            start_time = rospy.Time.now()
+            rate = rospy.Rate(20)
+            while not rospy.is_shutdown():
+                yaw_err = self.shortest_angle(target_yaw - self.yaw)
+                if abs(yaw_err) < 0.05:  # 3 degree tolerance
+                    break
+                elapsed = (rospy.Time.now() - start_time).to_sec()
+                if elapsed > timeout:
+                    rospy.logwarn(f"[{self.node_name}] Scan rotation timed out")
+                    break
+                omega = max(-self.align_tag_scan_omega, min(self.align_tag_scan_omega, 2.0 * yaw_err))
+                cmd = Twist2DStamped()
+                cmd.header.stamp = rospy.Time.now()
+                cmd.v = 0.0
+                cmd.omega = omega
+                self.car_cmd.publish(cmd)
+                rate.sleep()
+            # Stop
+            cmd = Twist2DStamped()
+            cmd.header.stamp = rospy.Time.now()
+            cmd.v = 0.0
+            cmd.omega = 0.0
+            self.car_cmd.publish(cmd)
+
+        # Scan sequence: left, center, right, center
+        scan_positions = [
+            (initial_yaw + self.align_tag_scan_angle, "left"),
+            (initial_yaw, "center"),
+            (initial_yaw - self.align_tag_scan_angle, "right"),
+            (initial_yaw, "center (final)")
+        ]
+
+        for target_yaw, position_name in scan_positions:
+            rospy.loginfo(f"[{self.node_name}] Scanning {position_name} (target: {np.degrees(target_yaw):.1f} deg) for tag {tag_id}")
+            rotate_to_angle(target_yaw)
+
+            # Wait for detections to update
+            rospy.sleep(self.align_tag_scan_wait)
+
+            # Check if tag is now visible
+            detection = self.apriltag_detections.get(tag_id)
+            if detection is not None:
+                rospy.loginfo(f"[{self.node_name}] Found tag {tag_id} at {position_name} position!")
+                # Return to initial orientation before returning
+                if abs(self.shortest_angle(self.yaw - initial_yaw)) > 0.05:
+                    rospy.loginfo(f"[{self.node_name}] Returning to initial orientation before alignment")
+                    rotate_to_angle(initial_yaw)
+                    rospy.sleep(self.align_tag_scan_wait)
+                    # Get fresh detection at initial position
+                    detection = self.apriltag_detections.get(tag_id)
+                return detection
+
+        rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not found after complete scan")
+        return None
+
     def align_to_apriltag_heading(self):
-        """Rotate robot to face the Apriltag of the current turn type before executing."""
+        """Rotate robot to align parallel with the Apriltag's x-axis before executing."""
         tag_id = self.turn_tag_id
         if tag_id is None:
             rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but no tag_id provided with turn_type.")
             return
+
+        # Log all currently detected tags for debugging
+        rospy.loginfo(f"[{self.node_name}] Currently detected tags: {list(self.apriltag_detections.keys())}")
+        rospy.loginfo(f"[{self.node_name}] Trying to align to tag: {tag_id}")
+
         detection = self.apriltag_detections.get(tag_id)
+
+        # If tag not found, try scanning for it
         if detection is None:
-            rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but tag {tag_id} not currently detected.")
-            return
+            rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not currently detected. Starting scan procedure.")
+            rospy.logwarn(f"[{self.node_name}] Available tags: {list(self.apriltag_detections.keys())}")
+
+            detection = self._scan_for_apriltag(tag_id)
+
+            # If still not found after scanning, give up and continue without alignment
+            if detection is None:
+                rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not found after scanning. Proceeding without alignment.")
+                return
 
         prev_state = self.internal_state
         self.internal_state = "ALIGNING"
 
+        # Extract AprilTag pose in camera frame
         pos = detection.transform.translation
-        desired_yaw = math.atan2(pos.y, pos.x)  # face the tag
+        rot = detection.transform.rotation
 
+        rospy.loginfo(f"[{self.node_name}] Tag {tag_id} position in camera frame: x={pos.x:.3f}, y={pos.y:.3f}, z={pos.z:.3f}")
+        rospy.loginfo(f"[{self.node_name}] Tag {tag_id} rotation quaternion: x={rot.x:.3f}, y={rot.y:.3f}, z={rot.z:.3f}, w={rot.w:.3f}")
+
+        # Convert quaternion to rotation matrix
+        R_cam_tag = tr.quaternion_matrix([rot.x, rot.y, rot.z, rot.w])[:3, :3]
+
+        # Extract tag axes in camera optical frame
+        # In camera optical frame: x=right, y=down, z=forward
+        tag_x_cam = R_cam_tag[:, 0]  # tag's x-axis (red arrow)
+        tag_y_cam = R_cam_tag[:, 1]  # tag's y-axis (green arrow)
+        tag_z_cam = R_cam_tag[:, 2]  # tag's z-axis (blue arrow, normal to tag surface)
+
+        rospy.loginfo(f"[{self.node_name}] Tag {tag_id} axes in camera frame:")
+        rospy.loginfo(f"[{self.node_name}]   x-axis (red): {tag_x_cam}")
+        rospy.loginfo(f"[{self.node_name}]   y-axis (green): {tag_y_cam}")
+        rospy.loginfo(f"[{self.node_name}]   z-axis (blue): {tag_z_cam}")
+
+        # Transform from camera optical frame to robot base frame
+        # Camera optical frame: x=right, y=down, z=forward
+        # Robot base frame: x=forward, y=left, z=up
+        # Transformation: robot_x = cam_z, robot_y = -cam_x, robot_z = -cam_y
+        tag_x_robot = np.array([tag_x_cam[2], -tag_x_cam[0], -tag_x_cam[1]])
+        tag_z_robot = np.array([tag_z_cam[2], -tag_z_cam[0], -tag_z_cam[1]])
+
+        # Also get tag position in robot frame for reference
+        tag_pos_robot = np.array([pos.z, -pos.x, -pos.y])
+
+        rospy.loginfo(f"[{self.node_name}] Tag {tag_id} in robot frame:")
+        rospy.loginfo(f"[{self.node_name}]   Position: {tag_pos_robot}")
+        rospy.loginfo(f"[{self.node_name}]   x-axis: {tag_x_robot}")
+        rospy.loginfo(f"[{self.node_name}]   z-axis: {tag_z_robot}")
+
+        # To align perpendicular to the stop line, we want to face TOWARD the tag
+        # This means aligning opposite to the tag's z-axis (which points away from the tag toward us)
+        # So we want to face in the direction of -tag_z_robot
+        alignment_direction = -tag_z_robot
+
+        rospy.loginfo(f"[{self.node_name}] Alignment direction (toward tag): {alignment_direction}")
+
+        # Calculate desired yaw to face toward the tag (perpendicular to stop line)
+        if np.linalg.norm(alignment_direction[:2]) < 1e-6:
+            # Fallback: tag is directly above/below, use position vector
+            rospy.logwarn(f"[{self.node_name}] Tag directly above/below, using position-based alignment")
+            desired_yaw = math.atan2(tag_pos_robot[1], tag_pos_robot[0])
+        else:
+            # The alignment direction has two opposite options (180° apart)
+            # Choose the one that requires the smallest rotation from current heading
+            yaw_option_1 = math.atan2(alignment_direction[1], alignment_direction[0])
+            yaw_option_2 = self.shortest_angle(yaw_option_1 + math.pi)
+
+            # Select the direction with smallest angular error from current yaw
+            error_1 = abs(self.shortest_angle(yaw_option_1 - self.yaw))
+            error_2 = abs(self.shortest_angle(yaw_option_2 - self.yaw))
+
+            desired_yaw = yaw_option_1 if error_1 < error_2 else yaw_option_2
+
+            rospy.loginfo(f"[{self.node_name}] Current yaw: {self.yaw:.3f} rad ({np.degrees(self.yaw):.1f} deg)")
+            rospy.loginfo(f"[{self.node_name}] Option 1: {yaw_option_1:.3f} rad ({np.degrees(yaw_option_1):.1f} deg), error: {error_1:.3f} rad ({np.degrees(error_1):.1f} deg)")
+            rospy.loginfo(f"[{self.node_name}] Option 2: {yaw_option_2:.3f} rad ({np.degrees(yaw_option_2):.1f} deg), error: {error_2:.3f} rad ({np.degrees(error_2):.1f} deg)")
+            rospy.loginfo(f"[{self.node_name}] Selected desired yaw (before offset): {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
+
+        # Apply heading offset
+        # Positive offset = rotate counterclockwise (left), Negative = clockwise (right)
+        desired_yaw_with_offset = self.shortest_angle(desired_yaw + self.align_tag_heading_offset)
+
+        if abs(self.align_tag_heading_offset) > 0.01:  # Only log if offset is significant
+            rospy.loginfo(f"[{self.node_name}] Heading offset: {self.align_tag_heading_offset:.3f} rad ({np.degrees(self.align_tag_heading_offset):.1f} deg)")
+            rospy.loginfo(f"[{self.node_name}] Final desired yaw (with offset): {desired_yaw_with_offset:.3f} rad ({np.degrees(desired_yaw_with_offset):.1f} deg)")
+
+        desired_yaw = desired_yaw_with_offset
+
+        # Control loop to rotate to desired heading
         start_time = rospy.Time.now()
         rate = rospy.Rate(20)
         while not rospy.is_shutdown():
             yaw_err = self.shortest_angle(desired_yaw - self.yaw)
             if abs(yaw_err) < self.align_tag_tolerance:
+                rospy.loginfo(f"[{self.node_name}] Alignment complete! Final error: {yaw_err:.3f} rad")
                 break
             elapsed = (rospy.Time.now() - start_time).to_sec()
             if elapsed > self.align_tag_max_time:
-                rospy.logwarn(f"[{self.node_name}] align_to_apriltag timed out after {elapsed:.2f}s")
+                rospy.logwarn(f"[{self.node_name}] align_to_apriltag timed out after {elapsed:.2f}s, error: {yaw_err:.3f} rad")
                 break
+            # Proportional control with saturation
             omega = max(-self.align_tag_omega_max, min(self.align_tag_omega_max, self.align_tag_k * yaw_err))
             cmd = Twist2DStamped()
             cmd.header.stamp = rospy.Time.now()
@@ -273,7 +436,7 @@ class UnicornIntersectionNode(DTROS):
             self.car_cmd.publish(cmd)
             rate.sleep()
 
-        # stop rotation
+        # Stop rotation
         stop_cmd = Twist2DStamped()
         stop_cmd.header.stamp = rospy.Time.now()
         stop_cmd.v = 0.0
@@ -527,20 +690,20 @@ class UnicornIntersectionNode(DTROS):
                 g.SE2_from_xytheta([self.x, self.y, self.yaw]),
             )
             # Annotate absolute pose values for quick debugging
-            pose_text = f"x:{self.x:+.2f} y:{self.y:+.2f} yaw:{self.yaw:+.2f}"
-            cv2.putText(img, pose_text, (10, img_size - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 90, 60), 2)
-            # Show the robot in the stop-line frame (offset visible)
-            robot_pos, robot_heading = g.translation_angle_from_SE2(stop_T_robot)
-            robot_px = to_pixel_coords(robot_pos)
-            cv2.circle(img, robot_px, 14, (0, 150, 0), -1)  # Darker green for current pose
-            cv2.putText(img, "Robot", (robot_px[0] - 28, robot_px[1] - 18),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 120, 0), 2)
-            # Heading arrow
-            arrow_length = 35
-            end_x = int(robot_px[0] + arrow_length * np.cos(robot_heading))
-            end_y = int(robot_px[1] - arrow_length * np.sin(robot_heading))
-            cv2.arrowedLine(img, robot_px, (end_x, end_y), (0, 180, 0), 2, tipLength=0.3)
+            # pose_text = f"x:{self.x:+.2f} y:{self.y:+.2f} yaw:{self.yaw:+.2f}"
+            # cv2.putText(img, pose_text, (10, img_size - 20),
+            #            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 90, 60), 2)
+            # # Show the robot in the stop-line frame (offset visible)
+            # robot_pos, robot_heading = g.translation_angle_from_SE2(stop_T_robot)
+            # robot_px = to_pixel_coords(robot_pos)
+            # cv2.circle(img, robot_px, 14, (0, 150, 0), -1)  # Darker green for current pose
+            # cv2.putText(img, "Robot", (robot_px[0] - 28, robot_px[1] - 18),
+            #            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 120, 0), 2)
+            # # Heading arrow
+            # arrow_length = 35
+            # end_x = int(robot_px[0] + arrow_length * np.cos(robot_heading))
+            # end_y = int(robot_px[1] - arrow_length * np.sin(robot_heading))
+            # cv2.arrowedLine(img, robot_px, (end_x, end_y), (0, 180, 0), 2, tipLength=0.3)
 
             # Also show normalized robot at origin for reference (paler)
             if self.stop_frame_robot_ref is None:
@@ -955,6 +1118,11 @@ class UnicornIntersectionNode(DTROS):
         self.align_tag_k = self.setupParam("~align_tag_k", 1.5)  # proportional gain
         self.align_tag_omega_max = self.setupParam("~align_tag_omega_max", 2.0)  # rad/s cap
         self.align_tag_max_time = self.setupParam("~align_tag_max_time", 2.5)  # seconds
+        self.align_tag_heading_offset = self.setupParam("~align_tag_heading_offset", 0.0)  # radians offset from perpendicular
+        # AprilTag scan parameters (when tag not initially visible)
+        self.align_tag_scan_angle = self.setupParam("~align_tag_scan_angle", 0.4)  # radians (~23 deg)
+        self.align_tag_scan_omega = self.setupParam("~align_tag_scan_omega", 0.3)  # rad/s
+        self.align_tag_scan_wait = self.setupParam("~align_tag_scan_wait", 0.3)  # seconds
 
     def updateParams(self, event):
         pass
@@ -1042,7 +1210,6 @@ class UnicornIntersectionNode(DTROS):
                     direction = np.sign(target_point[0] - self.reference_trajectory[0][0])  # +1 if goal x ahead, -1 if behind
                     signed_overrun = direction * (current_x - target_point[0])
 
-                    rospy.loginfo(f"[{self.node_name}] dist passed: {signed_overrun}")
                     if signed_overrun > threshold_x:
                         rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, overrun_x: {signed_overrun:.3f}, threshold_x: {threshold_x}")
                         return True
@@ -1054,47 +1221,61 @@ class UnicornIntersectionNode(DTROS):
             dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
 
             # rospy.loginfo(f"[{self.node_name}] dist: {dist}, threshold: {threshold}")
-            
+
             # If close enough to waypoint, advance
             if dist < threshold:
                 return True
-            
+
+            # Special handling for waypoints very close to origin (e.g., (0,0))
+            # which can cause issues with direction calculations
+            if np.sqrt(target_point[0]**2 + target_point[1]**2) < 0.05:  # waypoint within 5cm of origin
+                # For near-origin waypoints, just use distance check with relaxed threshold
+                if dist < threshold * 1.5:
+                    rospy.loginfo(f"[{self.node_name}] Near-origin waypoint, dist: {dist:.3f}, relaxed threshold: {threshold * 1.5:.3f}")
+                    return True
+
             # If no previous point, fall back to distance check only
             if prev_point is None:
                 return False
-            
+
             # Along-track/cross-track decomposition
             # Segment direction from prev_point to target_point
             seg_x = target_point[0] - prev_point[0]
             seg_y = target_point[1] - prev_point[1]
             seg_length = np.sqrt(seg_x**2 + seg_y**2)
-            
-            # Handle degenerate segment
+
+            # Handle degenerate segment (waypoints too close together)
             if seg_length < 1e-6:
+                # If segment is degenerate, just check distance to target
+                if dist < threshold * 1.2:
+                    rospy.loginfo(f"[{self.node_name}] Degenerate segment, using distance check")
+                    return True
                 return False
-            
+
             # Unit tangent along segment
             t_x = seg_x / seg_length
             t_y = seg_y / seg_length
-            
+
             # Vector from prev waypoint to robot
             v_x = current_x - prev_point[0]
             v_y = current_y - prev_point[1]
-            
+
             # Along-track progress (signed distance along segment direction)
             s = v_x * t_x + v_y * t_y
-            
+
             # Cross-track error (lateral distance to segment line)
             cross_track_x = v_x - s * t_x
             cross_track_y = v_y - s * t_y
             e = np.sqrt(cross_track_x**2 + cross_track_y**2)
-            
+
             # Advance if passed the waypoint along travel direction
             if s >= seg_length:
+                rospy.loginfo(f"[{self.node_name}] Passed waypoint along track, s: {s:.3f}, seg_length: {seg_length:.3f}")
                 return True
-            
+
             # Advance if close to segment line and near the end (helps when cutting corners)
             if e < threshold_x and s >= 0.90 * seg_length:
+                rospy.loginfo(f"[{self.node_name}] Near waypoint, e: {e:.3f}, s/seg_length: {s/seg_length:.2f}")
                 return True
 
             return False
