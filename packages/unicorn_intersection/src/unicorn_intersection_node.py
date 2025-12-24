@@ -2,11 +2,17 @@
 import json
 import numpy as np
 import rospy
-from duckietown_msgs.msg import BoolStamped, \
-    TurnIDandType, \
-    WheelEncoderStamped, \
-    Twist2DStamped, \
-    StopLineReading
+from duckietown_msgs.msg import (BoolStamped,
+    TurnIDandType,
+    WheelEncoderStamped,
+    Twist2DStamped,
+    StopLineReading,
+    LEDPattern,
+    FSMState,
+    AprilTagDetectionArray
+    )
+from duckietown_msgs.srv import ChangePattern, SetCustomLEDPattern
+from std_msgs.msg import String
 
 
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
@@ -48,6 +54,8 @@ class UnicornIntersectionNode(DTROS):
         self.stop_line_pose = Pose2D()
 
         self.debug = False
+        self.apriltag_detections = {}
+        self.turn_tag_id = None
 
 
         ## Subscribers
@@ -55,6 +63,15 @@ class UnicornIntersectionNode(DTROS):
         self.sub_encoder_left = message_filters.Subscriber("~left_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_encoder_right = message_filters.Subscriber("~right_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_stop_line_reading = rospy.Subscriber("~stop_line_reading", StopLineReading, self.cbStopLineReading)
+        # Raw Apriltag detections (AprilTagDetectionArray) from apriltag_detector_node
+        self.sub_apriltags = rospy.Subscriber("~detections", AprilTagDetectionArray, self.cbApriltags, queue_size=1)
+        self.sub_fsm_node_mode = rospy.Subscriber(
+            name='fsm_node/mode',   # The full, resolved topic name
+            data_class=FSMState,     # The message type it expects to receive
+            callback=self.onFSMStateChange, 
+            queue_size=1
+        )
+
 
         ## Publisher
         self.pub_int_done = rospy.Publisher("~intersection_done", BoolStamped, queue_size=1)
@@ -97,20 +114,75 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo("[unicorn_intersection_node] We have what we need, calculating reference trajectory")
             self.reference_trajectory = self.calculate_goal_trajectory()
             rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
-            car_control_msg = Twist2DStamped()
-            car_control_msg.header.stamp = rospy.Time.now()
-            car_control_msg.header.seq = 0
-            car_control_msg.v = 0
-            car_control_msg.omega = 0
-            self.car_cmd.publish(car_control_msg)
-            #TODO implement a delay with respect to the node frequency
-            rospy.loginfo(f"[unicorn_intersection_node] On marque le stop")
-            self.internal_state = "EXECUTING"
+            # Optional pre-alignment to Apriltag for this turn
+            if self.align_to_apriltag:
+                self.align_to_apriltag_heading()
+            self.intersection_planning()
+            if self.negotiation_end and self.internal_state != "EXECUTING":
+                car_control_msg = Twist2DStamped()
+                car_control_msg.header.stamp = rospy.Time.now()
+                car_control_msg.header.seq = 0
+                car_control_msg.v = 0
+                car_control_msg.omega = 0
+                self.car_cmd.publish(car_control_msg)
+                rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
+                self.internal_state = "EXECUTING"
         else:
             rospy.loginfo(f"[unicorn_intersection_node] We don't have what we need yet: "
                       f"stop_line received: {self.stop_line_pose_received} " 
                       f"turn_type_received: {self.turn_type_received} "
                       f"internal_state:{self.internal_state} ")
+            
+    def cbApriltags(self, msg):
+        """Store latest Apriltag detections (raw AprilTagDetectionArray) for alignment."""
+        if len(msg.detections) == 0:
+            return
+        self.apriltag_detections = {}
+        for detection in msg.detections:
+            self.apriltag_detections[detection.tag_id] = detection
+
+    def align_to_apriltag_heading(self):
+        """Rotate robot to face the Apriltag of the current turn type before executing."""
+        tag_id = self.turn_tag_id
+        if tag_id is None:
+            rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but no tag_id provided with turn_type.")
+            return
+        detection = self.apriltag_detections.get(tag_id)
+        if detection is None:
+            rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but tag {tag_id} not currently detected.")
+            return
+
+        prev_state = self.internal_state
+        self.internal_state = "ALIGNING"
+
+        pos = detection.transform.translation
+        desired_yaw = math.atan2(pos.y, pos.x)  # face the tag
+
+        start_time = rospy.Time.now()
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            yaw_err = self.shortest_angle(desired_yaw - self.yaw)
+            if abs(yaw_err) < self.align_tag_tolerance:
+                break
+            elapsed = (rospy.Time.now() - start_time).to_sec()
+            if elapsed > self.align_tag_max_time:
+                rospy.logwarn(f"[{self.node_name}] align_to_apriltag timed out after {elapsed:.2f}s")
+                break
+            omega = max(-self.align_tag_omega_max, min(self.align_tag_omega_max, self.align_tag_k * yaw_err))
+            cmd = Twist2DStamped()
+            cmd.header.stamp = rospy.Time.now()
+            cmd.v = 0.0
+            cmd.omega = omega
+            self.car_cmd.publish(cmd)
+            rate.sleep()
+
+        # stop rotation
+        stop_cmd = Twist2DStamped()
+        stop_cmd.header.stamp = rospy.Time.now()
+        stop_cmd.v = 0.0
+        stop_cmd.omega = 0.0
+        self.car_cmd.publish(stop_cmd)
+        self.internal_state = prev_state
 
     # Calculate the pose that we want to navigate to relative to where we are. If we are using
     # the stop line pose then we need to calculate the stop line relative to the robot, and then the
@@ -134,12 +206,102 @@ class UnicornIntersectionNode(DTROS):
         else:
             rospy.logerr("[unicorn_intersection_node] Something went wrong, invalid turn type")
 
-        robot_frame_goal_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), canonical_goal_pose)
+        # Blend between stop-aligned goal and canonical goal to reduce over-adjustment
+        blended_goal = self.blend_goal_pose(g_stop_pose, canonical_goal_pose, self.goal_blend_factor)
+        robot_frame_goal_pose = g.SE2.multiply(g.SE2.inverse(g_stop_pose), blended_goal)
 
         p, d = g.translation_angle_from_SE2(robot_frame_goal_pose)
         print(f"goal_pose in robot frame: position {p}, angle  {d}")
 
-        # Step 2: Interpolate along the trajectory to generate waypoints
+        # Store goal pose in robot frame for visualization
+        self.robot_frame_goal_pose = robot_frame_goal_pose
+
+        waypoints = []
+        directions = []
+
+        if self.turn_type == 0 and self.use_left_turn_via_point:
+            via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
+            blended_via = self.blend_goal_pose(g_stop_pose, via_pose, self.goal_blend_factor)
+            robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), blended_via)
+
+            p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
+            rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
+
+            seg1_count = max(1, self.left_num_waypoints // 2)
+            seg2_count = max(1, self.left_num_waypoints - seg1_count)
+
+            w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
+            w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
+            waypoints.extend(w1 + w2)
+            directions.extend(d1 + d2)
+        else:
+            w, d = self.interpolate_segment(g_stop_pose, robot_frame_goal_pose, self.num_waypoints)
+            waypoints.extend(w)
+            directions.extend(d)
+
+        # Transform waypoints to odometry frame
+        # odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        # waypoints_odom = []
+        # for wp, dir in zip(waypoints, directions):
+        #     wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
+        #     wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
+        #     pos, _ = g.translation_angle_from_SE2(wp_odom)
+        #     waypoints_odom.append(pos)
+        # rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
+
+        if self.visualization:
+            self.visualize_trajectory(waypoints, directions)
+            self.last_waypoints = waypoints
+            self.last_directions = directions
+        else:
+            self.last_waypoints = []
+            self.last_directions = []
+
+        self.publish_path_and_markers(waypoints, directions, g_stop_pose)
+        return waypoints  # Return waypoints!
+
+    def blend_goal_pose(self, g_stop_pose, canonical_goal_pose, blend):
+        """
+        Blend between the stop-aligned goal (stop frame) and the canonical goal pose.
+        blend=1.0 => fully adjusted by stop pose (current behavior)
+        blend=0.0 => ignore stop pose adjustment, use canonical directly
+        
+        Returns blended goal pose in the same frame as canonical_goal_pose.
+        """
+        blend = max(0.0, min(1.0, blend))
+        
+        # If blend=0, return canonical goal as-is
+        if blend == 0.0:
+            return canonical_goal_pose
+        
+        # Extract translation and angle from canonical goal pose
+        t_canonical, theta_canonical = g.translation_angle_from_SE2(canonical_goal_pose)
+        
+        # Get canonical goal in stop frame (this represents the stop-aligned version)
+        stop_T_goal = g.SE2.multiply(g.SE2.inverse(g_stop_pose), canonical_goal_pose)
+        t_goal_stop, theta_goal_stop = g.translation_angle_from_SE2(stop_T_goal)
+        
+        # Transform stop frame representation back to canonical frame
+        # This gives us the stop-aligned goal in canonical frame
+        goal_stop_aligned = g.SE2.multiply(g_stop_pose, stop_T_goal)
+        t_stop_aligned, theta_stop_aligned = g.translation_angle_from_SE2(goal_stop_aligned)
+        
+        # Blend translation and angle between canonical and stop-aligned versions
+        t_blend = (1 - blend) * np.array(t_canonical) + blend * np.array(t_stop_aligned)
+        theta_blend = self.angle_interp(theta_canonical, theta_stop_aligned, blend)
+        
+        return g.SE2_from_xytheta([t_blend[0], t_blend[1], theta_blend])
+
+    @staticmethod
+    def angle_interp(theta0, theta1, alpha):
+        """Interpolate angles along the shortest arc."""
+        # wrap difference to [-pi, pi]
+        d = (theta1 - theta0 + np.pi) % (2 * np.pi) - np.pi
+        return theta0 + alpha * d
+
+    def interpolate_segment(self, start_pose, end_pose, num_points):
+        """Interpolate SE(2) trajectory between two poses."""
+        robot_frame_goal_pose = g.SE2.multiply(g.SE2.inverse(start_pose), end_pose)
         vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
         alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
         waypoints = []
@@ -194,7 +356,7 @@ class UnicornIntersectionNode(DTROS):
         self.final_state = 0
 
     def cb_ts_encoders(self, left_encoder, right_encoder):
-        if self.internal_state != "EXECUTING":
+        if self.internal_state not in ("EXECUTING", "ALIGNING"):
             return
 
         timestamp_now = rospy.get_time()
@@ -267,6 +429,10 @@ class UnicornIntersectionNode(DTROS):
         self.encoders_timestamp_last = timestamp
         self.encoders_timestamp_last_local = timestamp_now
 
+        # Only run trajectory tracking when executing
+        if self.internal_state != "EXECUTING":
+            return
+
         car_control_msg = Twist2DStamped()
         #TODO
         car_control_msg.header.stamp = rospy.Time.now()
@@ -308,8 +474,11 @@ class UnicornIntersectionNode(DTROS):
             return
 
         self.turn_type = msg.turn_type
+        # Store tag id if provided (used for Apriltag alignment)
+        self.turn_tag_id = getattr(msg, "tag_id", None)
         self.turn_type_received = True
-        rospy.loginfo(f"[unicorn_intersection_node] Received turn type: {self.turn_type} ")
+        rospy.loginfo(f"[unicorn_intersection_node] Received turn type: {self.turn_type} from tag {self.turn_tag_id}")
+
         self.check_if_go()
 
     def setupParams(self):
@@ -320,7 +489,34 @@ class UnicornIntersectionNode(DTROS):
         self.canonical_goal_pose_right = self.setupParam("~canonical_goal_pose_right", default_pose)
         self.canonical_goal_pose_left = self.setupParam("~canonical_goal_pose_left", default_pose)
         self.canonical_goal_pose_straight = self.setupParam("~canonical_goal_pose_straight", default_pose)
+        self.goal_blend_factor = self.setupParam("~goal_blend_factor", 1.0)
+        # Intermediate "via point" for left turns to avoid cutting into opposite lane
+        # This point is placed forward of the robot before the lateral turn begins
+        default_left_via = {'x': 0.3, 'y': 0.0, 'theta': 0.0}
+        self.left_turn_via_point = self.setupParam("~left_turn_via_point", default_left_via)
+        self.use_left_turn_via_point = self.setupParam("~use_left_turn_via_point", True)
         self.speed = self.setupParam("~speed", 0.30)
+        # Waypoint counts per maneuver
+        self.left_num_waypoints = self.setupParam("~left_num_waypoints", 6)
+        self.right_num_waypoints = self.setupParam("~right_num_waypoints", 4)
+        self.straight_num_waypoints = self.setupParam("~straight_num_waypoints", 6)
+        # Waypoint reach thresholds per maneuver
+        self.left_x_threshold = self.setupParam("~left_x_threshold", 0.12)
+        self.left_dist_threshold = self.setupParam("~left_dist_threshold", 0.12)
+        self.right_x_threshold = self.setupParam("~right_x_threshold", 0.06)
+        self.right_dist_threshold = self.setupParam("~right_dist_threshold", 0.08)
+        self.straight_x_threshold = self.setupParam("~straight_x_threshold", 0.06)
+        self.straight_dist_threshold = self.setupParam("~straight_dist_threshold", 0.08)
+        # Distance past the stop line where trajectory should start (in meters)
+        # Positive value = start trajectory after crossing stop line
+        # Negative value = start trajectory before stop line
+        self.stop_line_offset = self.setupParam("~stop_line_offset", 0.0)
+        # Pre-alignment to Apriltag before executing the trajectory
+        self.align_to_apriltag = self.setupParam("~align_to_apriltag", False)
+        self.align_tag_tolerance = self.setupParam("~align_tag_tolerance", 0.15)  # radians
+        self.align_tag_k = self.setupParam("~align_tag_k", 1.5)  # proportional gain
+        self.align_tag_omega_max = self.setupParam("~align_tag_omega_max", 2.0)  # rad/s cap
+        self.align_tag_max_time = self.setupParam("~align_tag_max_time", 2.5)  # seconds
 
     def updateParams(self, event):
         pass
@@ -330,6 +526,11 @@ class UnicornIntersectionNode(DTROS):
         rospy.set_param(param_name, value)  # Write to parameter server for transparancy
         rospy.loginfo(f"[{self.node_name}] {param_name} = {value} ")
         return value
+
+    @staticmethod
+    def shortest_angle(theta):
+        """Wrap angle to [-pi, pi]."""
+        return (theta + math.pi) % (2 * math.pi) - math.pi
 
     def onShutdown(self):
         rospy.loginfo("[UnicornIntersectionNode] Shutdown.")

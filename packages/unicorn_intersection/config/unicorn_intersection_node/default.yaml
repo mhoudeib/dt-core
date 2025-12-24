@@ -20,5 +20,35 @@ canonical_goal_pose_straight: {
   y: 0.0,
   theta: 0.0,
 }
+goal_blend_factor: 0.8
+align_to_apriltag: True
+align_tag_tolerance: 0.15
+align_tag_k: 1.5
+align_tag_omega_max: 2.0
+align_tag_max_time: 2.5
+
+# Left turn via point: intermediate waypoint to avoid cutting into opposite lane
+# The robot will go forward to this point before beginning the left turn
+left_turn_via_point: {
+  x: 0.15,      # Go forward 0.15m into the intersection
+  y: 0.0,      # Stay centered (no lateral movement yet)
+  theta: 0.0,  # Keep heading straight
+}
+
+# Enable/disable the via point for left turns
+use_left_turn_via_point: True
+
+# Distance offset from detected stop line (in meters)
+# Positive = start trajectory after crossing stop line
+# Negative = start trajectory before stop line
+stop_line_offset: 0.0
+
+# Waypoint reach thresholds per maneuver
+left_x_threshold: 0.15
+left_dist_threshold: 0.08
+right_x_threshold: 0.15
+right_dist_threshold: 0.08
+straight_x_threshold: 0.08
+straight_dist_threshold: 0.06
 
 debug_dir: -1
