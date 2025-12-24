@@ -88,7 +88,7 @@ states:
       - stop_line_filter_node
       - unicorn_intersection_node
       - led_emitter_node
-    lights: "RED"
+    lights: "CAR_DRIVING"
 
   DETECT_INTERSECTION_TYPE:
     transitions:
@@ -113,7 +113,7 @@ states:
       - random_april_tag_turns_node
       - unicorn_intersection_node
       - led_emitter_node
-    lights: "WHITE"
+    # No lights: entry - allows unicorn_intersection_node to control LEDs with custom patterns
 
   TRAFFIC_LIGHT_INTERSECTION:
     transitions:

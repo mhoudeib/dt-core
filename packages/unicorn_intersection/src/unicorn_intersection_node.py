@@ -229,10 +229,16 @@ class UnicornIntersectionNode(DTROS):
                 car_control_msg.v = 0
                 car_control_msg.omega = 0
                 self.car_cmd.publish(car_control_msg)
+
+                # Update LED to show direction color (remove green "ready" indicator)
+                # Now that execution is starting, show priority + direction instead of priority + ready
+                Led_pattern = self.get_led_pattern(priority_level=self.priority_level, direction_index=self.turn_type, is_ready=False)
+                self.update_leds(Led_pattern)
+
                 rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
                 self.internal_state = "EXECUTING"
         else:
-            self.intersection_planning()
+            # self.intersection_planning()
             rospy.loginfo(f"[unicorn_intersection_node] We don't have what we need yet: "
                       f"stop_line received: {self.stop_line_pose_received} "
                       f"turn_type_received: {self.turn_type_received} "
@@ -507,14 +513,14 @@ class UnicornIntersectionNode(DTROS):
             directions.extend(d)
 
         # Transform waypoints to odometry frame
-        # odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
-        # waypoints_odom = []
-        # for wp, dir in zip(waypoints, directions):
-        #     wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
-        #     wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
-        #     pos, _ = g.translation_angle_from_SE2(wp_odom)
-        #     waypoints_odom.append(pos)
-        # rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
+        odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        waypoints_odom = []
+        for wp, dir in zip(waypoints, directions):
+            wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
+            wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
+            pos, _ = g.translation_angle_from_SE2(wp_odom)
+            waypoints_odom.append(pos)
+        rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
 
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
@@ -525,7 +531,7 @@ class UnicornIntersectionNode(DTROS):
             self.last_directions = []
 
         self.publish_path_and_markers(waypoints, directions, g_stop_pose)
-        return waypoints  # Return waypoints!
+        return waypoints_odom  # Return waypoints!
 
     def blend_goal_pose(self, g_stop_pose, canonical_goal_pose, blend):
         """
@@ -1031,9 +1037,7 @@ class UnicornIntersectionNode(DTROS):
         
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_], prev_point ):
             if self.iter_ == 0:
-                # Use predefined YELLOW pattern when starting navigation
-                self.set_led_pattern("YELLOW")
-                # Start periodic re-application timer during execution
+                # Start periodic re-application timer during execution to maintain custom LED pattern
                 if self.internal_state == "EXECUTING":
                     self._start_led_pattern_timer()
             self.iter_ += 1
