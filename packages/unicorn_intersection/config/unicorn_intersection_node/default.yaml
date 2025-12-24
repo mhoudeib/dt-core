@@ -31,7 +31,7 @@ align_tag_max_time: 2.5
 align_tag_scan_angle: 0.4
 align_tag_scan_omega: 0.3
 align_tag_scan_wait: 0.3
-align_tag_heading_offset: 0.3
+align_tag_heading_offset: 0.23
 
 # Left turn via point: intermediate waypoint to avoid cutting into opposite lane
 # The robot will go forward to this point before beginning the left turn
