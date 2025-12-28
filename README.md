@@ -135,9 +135,11 @@ Upon approaching a stop line, the robot gradually reduces its velocity using a d
 
 The decrease is linear in the transition area with a null final speed to stop the vehicle.
 The speed decrease factor is given by:
+
 $$
 f_{dec}(x) = {{x_{end}-x}\over{x_{end}-x_{start}}}
 $$
+
 Where $x_{end}$ & $x_{start}$ define the transition area.
 
 Once stopped, the controller switches to a waypoint-based trajectory follower. Linear and angular velocities are computed using proportional control laws in the robot frame:
@@ -233,9 +235,9 @@ Our short range vehicle to vehicle communication protocol is based on SAE's J273
 
 | Index | Color | Planned Trajectory | 
 | :--- | :--- | :--- | 
-| 0 | $\color{cyan}{\blacksquare}$ | Turning Left | 
+| 0 | ![](https://img.shields.io/badge/-%2300FFFF?style=flat-square&labelColor=%2300FFFF) | Turning Left | 
 | 1 | 🟨 | Going Straight | 
-| 2 | $\color{pink}{\blacksquare}$ | Turning Right |
+| 2 | ![](https://img.shields.io/badge/-%23FFC0CB?style=flat-square&labelColor=%23FFC0CB) | Turning Right |
 
 - **State Sequence:**
 
