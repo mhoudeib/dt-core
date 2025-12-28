@@ -149,7 +149,8 @@ The navigation control command are given by:
 
 $$
 \nu = k_{\rho}((x_{w} - x)cos(\theta)-(y_{w} - y)sin(\theta))
-\\
+$$
+$$
 \omega = k_{\alpha}[atan2((y_{w} - y), (x_{w} - x))-\theta]
 $$
 
@@ -233,7 +234,7 @@ Our short range vehicle to vehicle communication protocol is based on SAE's J273
 | Index | Color | Planned Trajectory | 
 | :--- | :--- | :--- | 
 | 0 | $\color{cyan}{\blacksquare}$ | Turning Left | 
-| 1 | $\color{yellow}{\blacksquare}$ | Going Straight | 
+| 1 | 🟨 | Going Straight | 
 | 2 | $\color{pink}{\blacksquare}$ | Turning Right |
 
 - **State Sequence:**
@@ -241,9 +242,9 @@ Our short range vehicle to vehicle communication protocol is based on SAE's J273
 | Phase	| LED 0 (Front Left)| LED 4 (Front Right)| Meaning |
 | :--- | :--- | :--- | :--- |
 | Approach / Stop |	Priority Color |	Direction Color	|Intent broadcasting (Negotiation) |
-| Validation (Ready) | Priority Color |	$\color{green}{\blacksquare}$	| Scenario calculated, ready to move |
-| Crossing | $\color{yellow}{\blacksquare}$ | $\color{yellow}{\blacksquare}$ | Occupying the intersection (Warning) |
-| Exit | $\color{green}{\blacksquare}$ | $\color{green}{\blacksquare}$ | Intersection cleared |
+| Validation (Ready) | Priority Color | 🟩 | Scenario calculated, ready to move |
+| Crossing | 🟨 | 🟨 | Occupying the intersection (Warning) |
+| Exit | 🟩 | 🟩 | Intersection cleared |
 | Idle | 🔲 | 🔲 | Normal driving / No conflict |
 
 **FSM Integration:**
