@@ -133,12 +133,29 @@ This significantly stabilizes the `at_stop_line` condition and avoids false exit
 
 Upon approaching a stop line, the robot gradually reduces its velocity using a distance-based decay factor, ensuring enough spatial and temporal margin to plan the intersection crossing.
 
+The decrease is linear in the transition area with a null final speed to stop the vehicle.
+The speed decrease factor is given by:
+$$
+f_{dec}(x) = {{x_{end}-x}\over{x_{end}-x_{start}}}
+$$
+Where $x_{end}$ & $x_{start}$ define the transition area.
+
 Once stopped, the controller switches to a waypoint-based trajectory follower. Linear and angular velocities are computed using proportional control laws in the robot frame:
 
 - Linear velocity aligns the robot with the waypoint direction
 - Angular velocity corrects heading error toward the target
 
-This decoupled control scheme allows smooth execution of complex intersection maneuvers :contentReference[oaicite:4]{index=4}.
+The navigation control command are given by:
+
+$$
+\nu = k_{\rho}((x_{w} - x)cos(\theta)-(y_{w} - y)sin(\theta))
+\\
+\omega = k_{\alpha}[atan2((y_{w} - y), (x_{w} - x))-\theta]
+$$
+
+This control law required the tuning of two gains to work properly in real conditions.
+
+This decoupled control scheme allows smooth execution of complex intersection maneuvers : contentReference[oaicite:4]{index=4}.
 
 ---
 
@@ -196,27 +213,38 @@ This pre-alignment improves trajectory following accuracy and reduces the robot'
 
 ### LED Communication Protocol
 
-For future multi-robot scenarios, we implemented a 5-LED communication protocol that signals robot priority and intended direction at intersections.
+For future multi-robot scenarios, we implemented a 5-LED communication protocol that signals robot priority and intended direction at intersections. Our protocol uses color charts to overcome the instability frequency flickering problem previously encountered in Duckietown.
+
+Our short range vehicle to vehicle communication protocol is based on SAE's J2735 standard basic safety messages. These messages aim to provide minimal information to plan intersection crossings with multiple vehicles for the Spatio-Temporal Intersection Protocols approach [oaicite:5]{index=5}.
 
 **LED Array Structure:** `[Front Left, Rear Left, Top, Rear Right, Front Right]`
 
-**Active LEDs:**
-- **Front Left (Index 0):** Priority level (1-4) encoded as color
-  - Priority 1: Red
-  - Priority 2: Blue
-  - Priority 3: Purple
-  - Priority 4: White
-- **Front Right (Index 4):** Direction or ready state
-  - Left turn: Cyan
-  - Straight: Yellow
-  - Right turn: Pink
-  - Ready to enter: Green
+- **Front Left (LED 0):** Priority level (1-4) encoded as color
 
-**State Sequence:**
-1. **At stop line:** Display priority + direction colors
-2. **Planning complete:** Front right LED turns green (ready signal)
-3. **Executing turn:** Front right returns to direction color
-4. **Intersection complete:** Full green pattern
+| Level | Color | Priority | 
+| :--- | :--- | :--- | 
+| 1 | 🟥 | 1 (highest) | 
+| 2 | 🟦 | 2 | 
+| 3 | 🟪 | 3 | 
+| 4 | ⬜ | 4 (lowest) |
+
+- **Front Right (LED 4):** Direction or ready state
+
+| Index | Color | Planned Trajectory | 
+| :--- | :--- | :--- | 
+| 0 | $\color{cyan}{\blacksquare}$ | Turning Left | 
+| 1 | $\color{yellow}{\blacksquare}$ | Going Straight | 
+| 2 | $\color{pink}{\blacksquare}$ | Turning Right |
+
+- **State Sequence:**
+
+| Phase	| LED 0 (Front Left)| LED 4 (Front Right)| Meaning |
+| :--- | :--- | :--- | :--- |
+| Approach / Stop |	Priority Color |	Direction Color	|Intent broadcasting (Negotiation) |
+| Validation (Ready) | Priority Color |	$\color{green}{\blacksquare}$	| Scenario calculated, ready to move |
+| Crossing | $\color{yellow}{\blacksquare}$ | $\color{yellow}{\blacksquare}$ | Occupying the intersection (Warning) |
+| Exit | $\color{green}{\blacksquare}$ | $\color{green}{\blacksquare}$ | Intersection cleared |
+| Idle | 🔲 | 🔲 | Normal driving / No conflict |
 
 **FSM Integration:**
 The LED system is integrated with the finite state machine, with custom patterns allowed during `STOP_SIGN_INTERSECTION` and `INTERSECTION_CONTROL` states. A 0.5s re-application timer ensures patterns persist despite FSM state transitions.
@@ -252,5 +280,7 @@ Potential extensions include:
 
 4. **Censi, A., Paull, L., Tani, J., & Frazzoli, E. (2019).** "The Duckietown Project: An Open Platform for Research and Education in Autonomy." *In The Future of Transportation*, MIT Press.
    - Educational framework and system design principles for autonomous vehicle research
+
+5. **R. Azimi, G. Bhatia, R. R. Rajkumar and P. Mudalige**, "STIP: Spatio-temporal intersection protocols for autonomous vehicles," 2014 ACM/IEEE International Conference on Cyber-Physical Systems (ICCPS), Berlin, Germany, 2014, pp. 1-12, doi: 10.1109/ICCPS.2014.6843706.
 
 ---
