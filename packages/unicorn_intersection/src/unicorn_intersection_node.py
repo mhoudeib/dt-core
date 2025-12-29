@@ -513,14 +513,14 @@ class UnicornIntersectionNode(DTROS):
             directions.extend(d)
 
         # Transform waypoints to odometry frame
-        odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
-        waypoints_odom = []
-        for wp, dir in zip(waypoints, directions):
-            wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
-            wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
-            pos, _ = g.translation_angle_from_SE2(wp_odom)
-            waypoints_odom.append(pos)
-        rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
+        # odom_T_robot = g.SE2_from_xytheta([self.x, self.y, self.yaw])
+        # waypoints_odom = []
+        # for wp, dir in zip(waypoints, directions):
+        #     wp_robot = g.SE2_from_xytheta([wp[0], wp[1], dir])
+        #     wp_odom = g.SE2.multiply(odom_T_robot, wp_robot)
+        #     pos, _ = g.translation_angle_from_SE2(wp_odom)
+        #     waypoints_odom.append(pos)
+        # rospy.loginfo(f"[unicorn_intersection_node] waypoints_odom: {waypoints_odom}")
 
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
@@ -531,7 +531,7 @@ class UnicornIntersectionNode(DTROS):
             self.last_directions = []
 
         self.publish_path_and_markers(waypoints, directions, g_stop_pose)
-        return waypoints_odom  # Return waypoints!
+        return waypoints  # Return waypoints!
 
     def blend_goal_pose(self, g_stop_pose, canonical_goal_pose, blend):
         """
