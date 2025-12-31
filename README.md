@@ -214,6 +214,22 @@ This pre-alignment improves trajectory following accuracy and reduces the robot'
 
 ---
 
+### Robust AprilTag Detection and Filtering
+
+A critical challenge in intersection navigation is reliably identifying the correct AprilTag among multiple detections, especially when tags may be visible from oblique angles, at the edge of the camera's field of view, or at varying distances. To address this, we implemented a multi-criteria filtering system that selects only the most relevant tag for intersection identification.
+
+The system evaluates each detected AprilTag against three spatial constraints:
+
+1. **Perpendicularity Check**: The tag's surface normal must be roughly facing the camera, indicating the robot is approaching the intersection head-on rather than from an angle. The system extracts the tag's orientation quaternion, converts it to a rotation matrix, and computes the dot product between the tag's normal vector and the camera's optical axis. Tags are rejected if the angle exceeds configurable thresholds (typically ±45° from perpendicular), corresponding to `|dot_product| < 0.707`. This prevents misidentification when the robot glimpses tags from adjacent lanes or past intersections.
+
+2. **Horizontal Viewing Angle**: To ensure the robot only considers tags directly ahead (not those to the left or already passed), the system calculates the horizontal angle using `arctan2(pos.y, pos.x)` where `pos.x` is forward distance and `pos.y` is lateral offset. Tags appearing on the left side of the camera view (negative horizontal angles below a threshold) are filtered out. This criterion is robust regardless of the robot's exact position in the lane and prevents the robot from reacting to intersection signs it has already passed.
+
+3. **Distance Bounds**: Tags outside a configurable maximum distance are ignored to avoid readings of distant intersections. Among all tags passing the above filters, the system selects the **closest** one, ensuring the robot responds to the immediate intersection rather than one further ahead.
+
+Only tags satisfying all geometric constraints are considered, and the nearest valid tag is selected for intersection type determination. 
+
+---
+
 ### LED Communication Protocol
 
 For future multi-robot scenarios, we implemented a 5-LED communication protocol that signals robot priority and intended direction at intersections. Our protocol uses color charts to overcome the instability frequency flickering problem previously encountered in Duckietown.
