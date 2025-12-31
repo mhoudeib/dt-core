@@ -2,16 +2,20 @@
 import json
 import numpy as np
 import rospy
-from duckietown_msgs.msg import BoolStamped, \
-    TurnIDandType, \
-    WheelEncoderStamped, \
-    Twist2DStamped, \
-    StopLineReading
+from duckietown_msgs.msg import (BoolStamped,
+    TurnIDandType,
+    WheelEncoderStamped,
+    Twist2DStamped,
+    StopLineReading,
+    LEDPattern,
+    FSMState
+    )
 
 
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
 import math 
 from geometry_msgs.msg import Quaternion, Twist, Pose2D, Point, Vector3, TransformStamped, Transform
+from duckietown_msgs.srv import SetCustomLEDPattern, SetCustomLEDPatternRequest, ChangePattern
 
 from nav_msgs.msg import Odometry
 
@@ -65,6 +69,23 @@ class UnicornIntersectionNode(DTROS):
             queue_size=self.num_waypoints,
         )
 
+        # LED service proxies - wait for services to be available
+        try:
+            rospy.wait_for_service('led_emitter_node/set_pattern', timeout=5.0)
+            rospy.wait_for_service('led_emitter_node/set_custom_pattern', timeout=5.0)
+            self.led_pattern_service = rospy.ServiceProxy('led_emitter_node/set_pattern', ChangePattern)
+            self.led_custom_pattern_service = rospy.ServiceProxy('led_emitter_node/set_custom_pattern', SetCustomLEDPattern)
+            rospy.loginfo(f"[{self.node_name}] LED services connected")
+        except rospy.ROSException as e:
+            rospy.logwarn(f"[{self.node_name}] LED services not available: {e}. LEDs may not work.")
+            self.led_pattern_service = None
+            self.led_custom_pattern_service = None
+
+        # Store current LED pattern state for re-application after FSM changes
+        self.current_led_pattern = None
+        self.current_led_pattern_type = None  # 'predefined' or 'custom'
+        self.led_pattern_timer = None  # Timer to periodically re-apply LED pattern
+
         self.ts_encoders = message_filters.ApproximateTimeSynchronizer(
             [self.sub_encoder_left, self.sub_encoder_right], 1, 1
         )
@@ -79,9 +100,31 @@ class UnicornIntersectionNode(DTROS):
         self.reset_odometry()
 
         self.alpha = 0.0
+        
+        #Led protocol
+
+        self.direction_colors = {
+            -1: 'switchedoff', #Default
+            0: 'cyan',   # Left
+            1: 'yellow', # Straight
+            2: 'pink'    # Right
+        }
+
+        self.priority_colors = {
+            1: 'red',
+            2: 'blue',
+            3: 'purple',
+            4: 'white'
+        }
+
+        #Intersection planning mannagement variables
+        self.priority_level = -1
+        self.negotiation_end = False
+        self.led_priority_set = False
+        self.led_ready_set = False
 
         self.log("Initialialized unicorn intersection node")
-
+    
     def cbStopLineReading(self, msg):
         if self.stop_line_pose_received:
             return
@@ -97,16 +140,18 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo("[unicorn_intersection_node] We have what we need, calculating reference trajectory")
             self.reference_trajectory = self.calculate_goal_trajectory()
             rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
-            car_control_msg = Twist2DStamped()
-            car_control_msg.header.stamp = rospy.Time.now()
-            car_control_msg.header.seq = 0
-            car_control_msg.v = 0
-            car_control_msg.omega = 0
-            self.car_cmd.publish(car_control_msg)
-            #TODO implement a delay with respect to the node frequency
-            rospy.loginfo(f"[unicorn_intersection_node] On marque le stop")
-            self.internal_state = "EXECUTING"
+            self.intersection_planning()
+            if self.negotiation_end and self.internal_state != "EXECUTING":
+                car_control_msg = Twist2DStamped()
+                car_control_msg.header.stamp = rospy.Time.now()
+                car_control_msg.header.seq = 0
+                car_control_msg.v = 0
+                car_control_msg.omega = 0
+                self.car_cmd.publish(car_control_msg)
+                rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
+                self.internal_state = "EXECUTING"
         else:
+            self.intersection_planning()
             rospy.loginfo(f"[unicorn_intersection_node] We don't have what we need yet: "
                       f"stop_line received: {self.stop_line_pose_received} " 
                       f"turn_type_received: {self.turn_type_received} "
@@ -280,8 +325,11 @@ class UnicornIntersectionNode(DTROS):
         self.car_cmd.publish(car_control_msg)
 
         if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
+            if self.iter_ == 0:
+                self.update_leds(['yellow', 'yellow', 'yellow', 'yellow', 'yellow']) #LED message to broadcast intersection navigation in progress
             self.iter_ += 1
             if self.iter_ == self.num_waypoints:
+                self.update_leds(['green', 'green', 'green', 'green', 'green']) #LED message to broadcast intersection navigation complete
                 self.internal_state = "READY"
                 self.stop_line_pose_received = False
                 self.turn_type_received = False
@@ -290,6 +338,13 @@ class UnicornIntersectionNode(DTROS):
                 msg_done.data = True
                 self.pub_int_done.publish(msg_done)
                 self.reset_odometry()
+                self.priority_level = -1
+                self.turn_type = -1
+                self.negotiation_end = False
+                self.led_priority_set = False
+                self.led_ready_set = False
+                self.current_led_pattern = None
+                self.current_led_pattern_type = None
                 rospy.loginfo("[unicorn intersection node] intersection navigation complete")
 
 
@@ -372,6 +427,144 @@ class UnicornIntersectionNode(DTROS):
                 return True
 
             return False
+
+    def set_led_pattern(self, pattern_name, force=False):
+        """
+        Set a predefined LED pattern by name (e.g., "BLUE", "GREEN", "YELLOW", "RED").
+        
+        Args:
+            pattern_name: String name of the predefined pattern
+        """
+        if self.led_pattern_service is None:
+            rospy.logwarn(f"[{self.node_name}] LED pattern service not available, cannot set pattern: {pattern_name}")
+            return
+
+        # Skip if already set to this pattern and not forcing an update
+        if (not force and self.current_led_pattern_type == 'predefined'
+                and self.current_led_pattern == pattern_name):
+            return
+        
+        pattern_msg = String()
+        pattern_msg.data = pattern_name
+        try:
+            self.led_pattern_service(pattern_name=pattern_msg)
+            self.current_led_pattern = pattern_name
+            self.current_led_pattern_type = 'predefined'
+            rospy.loginfo(f"[{self.node_name}] Set LED pattern to: {pattern_name}")
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[{self.node_name}] Failed to set LED pattern {pattern_name}: {e}")
+
+    def update_leds(self, color_list, frequency=0.0, force=False):
+        """
+        Set a custom LED pattern using a list of colors.
+        
+        Args:
+            color_list: List of 5 color names (e.g., ['red', 'blue', 'white', 'green', 'yellow'])
+            frequency: Blinking frequency in Hz (0.0 for solid)
+        """
+        if self.led_custom_pattern_service is None:
+            rospy.logwarn(f"[{self.node_name}] LED custom pattern service not available, cannot set custom pattern")
+            return
+
+        # Skip if this exact pattern is already active and not forcing an update
+        normalized_pattern = (tuple(color_list), frequency)
+        if (not force and self.current_led_pattern_type == 'custom'
+                and self.current_led_pattern == normalized_pattern):
+            return
+        
+        pattern_msg = LEDPattern()
+        # We assign the list of 5 colors
+        pattern_msg.color_list = color_list 
+        pattern_msg.frequency = frequency
+        # We activate all the leds (no flickering by default)
+        pattern_msg.color_mask = [1, 1, 1, 1, 1]
+        pattern_msg.frequency_mask = [0, 0, 0, 0, 0]
+        
+        try:
+            self.led_custom_pattern_service(pattern=pattern_msg)
+            self.current_led_pattern = normalized_pattern
+            self.current_led_pattern_type = 'custom'
+            rospy.loginfo(f"[{self.node_name}] Set custom LED pattern: {color_list}")
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[{self.node_name}] Failed to set custom LED pattern: {e}")
+
+    def _reapply_led_pattern(self, event=None, force=False):
+        """Re-apply the current LED pattern (used after FSM state changes or timer callbacks)"""
+        if self.current_led_pattern is None:
+            return
+        
+        if self.current_led_pattern_type == 'predefined':
+            self.set_led_pattern(self.current_led_pattern, force=force)
+        elif self.current_led_pattern_type == 'custom':
+            color_list, frequency = self.current_led_pattern
+            self.update_leds(list(color_list), frequency, force=force)
+
+    def _start_led_pattern_timer(self):
+        """Start a timer to periodically re-apply LED pattern during execution"""
+        self._stop_led_pattern_timer()  # Stop any existing timer
+        self.led_pattern_timer = rospy.Timer(rospy.Duration(0.5), self._reapply_led_pattern)
+
+    def _stop_led_pattern_timer(self):
+        """Stop the LED pattern re-application timer"""
+        if self.led_pattern_timer is not None:
+            self.led_pattern_timer.shutdown()
+            self.led_pattern_timer = None
+
+    def get_led_pattern(self, priority_level, direction_index, is_ready=False):
+        """
+        priority_level: int (1-4)
+        direction_index: int (0-2)
+        is_ready: bool (If True, the right LED turns green to confirm the start)
+        """
+        # 1. Priority color (LED 0 - Left front)
+        priority_color = self.priority_colors.get(priority_level, 'white')
+
+        # 2. Direction color (LED 4 - Right front)
+        if is_ready:
+            direction_color = 'green'
+        else:
+            direction_color = self.direction_colors.get(direction_index, 'white')
+
+        # 3. Compose the pattern [FL, RL, TOP, RR, FR]
+        pattern = [
+            priority_color,  # Index 0: Front Left
+            'switchedoff',   # Index 1: Rear Left
+            'switchedoff',   # Index 2: Top
+            'switchedoff',   # Index 3: Rear Right
+            direction_color  # Index 4: Front Right
+        ]
+        
+        return pattern
+
+    def intersection_planning(self):
+        if self.priority_level == -1:
+            self.priority_level = self.get_priority()
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= 0)
+            self.update_leds(Led_pattern)
+            rospy.loginfo(f"[unicorn_intersection_node] Set priority to: {self.priority_level} ")
+
+        if(self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type)
+            self.update_leds(Led_pattern)
+            #TODO generate the intersection scenario
+            rospy.Duration(1.0)#emulate the time of scenario computing
+            rospy.loginfo(f"[unicorn_intersection_node] Intersection scenario ready")
+            Led_pattern = self.get_led_pattern(priority_level= self.priority_level, direction_index= self.turn_type, is_ready=True)
+            self.update_leds(Led_pattern)
+            while self.negotiation_end != True:
+                #TODO control the start posibility according to scenario
+                rospy.Duration(1.0)#emulate the time of control
+                self.negotiation_end = True
+
+    def get_priority(self):
+        """
+        Get the priority of the vehicule by counting the number of duckiebot in the intersection
+        :param self: Description
+        """
+
+        #TODO implement a way to count vehicules in the intersection
+        prio = 1
+        return prio
 
 if __name__ == "__main__":
     unicorn_intersection_node = UnicornIntersectionNode(node_name="unicorn_intersection_node")
