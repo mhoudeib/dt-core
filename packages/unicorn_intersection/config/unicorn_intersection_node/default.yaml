@@ -16,7 +16,7 @@ canonical_goal_pose_left: {
 }
 
 canonical_goal_pose_straight: {
-  x: 0.7,
+  x: 0.75,
   y: 0.0,
   theta: 0.0,
 }
@@ -35,7 +35,7 @@ align_tag_heading_offset: 0.3
 # Left turn via point: intermediate waypoint to avoid cutting into opposite lane
 # The robot will go forward to this point before beginning the left turn
 left_turn_via_point: {
-  x: 0.15,      # Go forward 0.15m into the intersection
+  x: 0.2,      # Go forward 0.20m into the intersection
   y: 0.0,      # Stay centered (no lateral movement yet)
   theta: 0.0,  # Keep heading straight
 }

@@ -18,11 +18,13 @@ from geometry_msgs.msg import Quaternion, Twist, Pose2D, Point, Vector3, Transfo
 from duckietown_msgs.srv import SetCustomLEDPattern, SetCustomLEDPatternRequest, ChangePattern
 
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CompressedImage
 
 import message_filters
 from tf import transformations as tr
 
 import geometry as g
+import cv2
 
 class UnicornIntersectionNode(DTROS):
     def __init__(self, node_name):
@@ -80,6 +82,11 @@ class UnicornIntersectionNode(DTROS):
             Odometry,
             queue_size=self.num_waypoints,
         )
+        self.pub_debug_trajectory_img = rospy.Publisher(
+            "~debug/trajectory/compressed",
+            CompressedImage,
+            queue_size=1,
+        )
 
         # LED service proxies - wait for services to be available
         try:
@@ -134,7 +141,6 @@ class UnicornIntersectionNode(DTROS):
         self.negotiation_end = False
         self.led_priority_set = False
         self.led_ready_set = False
-        self.apriltag_detections = {}
 
         self.log("Initialialized unicorn intersection node")
 
@@ -155,7 +161,6 @@ class UnicornIntersectionNode(DTROS):
             self.stop_line_pose_received = False
             self.turn_type_received = False
             self.g_stop_pose_plan = None
-            self.stop_frame_robot_ref = None
             self.priority_level = 0
             self.negotiation_end = False
             self.led_priority_set = False
@@ -371,7 +376,7 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo(f"[{self.node_name}] Option 2: {yaw_option_2:.3f} rad ({np.degrees(yaw_option_2):.1f} deg), error: {error_2:.3f} rad ({np.degrees(error_2):.1f} deg)")
             rospy.loginfo(f"[{self.node_name}] Selected desired yaw (before offset): {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
 
-        if abs(desired_yaw) > np.pi/2:
+        if abs(desired_yaw) > 0.5: #TODO: find problem of wrong tag being chosen as target instead of hard constraint
             rospy.logwarn(f"[{self.node_name}] Desired yaw is too large, cannot align to AprilTag")
             return
 
@@ -413,40 +418,134 @@ class UnicornIntersectionNode(DTROS):
     def calculate_goal_trajectory(self):
         self.stop_line_pose.theta = 0.0 # assumes robot is aligned
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
+        rospy.loginfo(f"[unicorn_intersection_node] stop_line_pose: {self.stop_line_pose}")
+        self.g_stop_pose_plan = g_stop_pose
         # TODO what if we don't want to use the stop_pose?
 
-        # TODO this should really be turned into an enum
         # Step 1 - calculate the goal pose in the robot frame
         if self.turn_type == 0:
             canonical_goal_pose = self.goal_poses['left']
+            self.num_waypoints = self.left_num_waypoints
+            rospy.loginfo(f"[unicorn_intersection_node] We are turning left")
         elif self.turn_type == 1:
             canonical_goal_pose = self.goal_poses['straight']
+            self.num_waypoints = self.straight_num_waypoints
+            rospy.loginfo(f"[unicorn_intersection_node] We are going straigth")
         elif self.turn_type == 2:
             canonical_goal_pose = self.goal_poses['right']
+            self.num_waypoints = self.right_num_waypoints
+            rospy.loginfo(f"[unicorn_intersection_node] We are turning right")
         else:
             rospy.logerr("[unicorn_intersection_node] Something went wrong, invalid turn type")
-
+        
         robot_frame_goal_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), canonical_goal_pose)
 
         p, d = g.translation_angle_from_SE2(robot_frame_goal_pose)
         print(f"goal_pose in robot frame: position {p}, angle  {d}")
 
         # Step 2: Interpolate along the trajectory to generate waypoints
-        vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
-        alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
         waypoints = []
         directions = []
-        for alpha in alphas:
-            rel = g.SE2.group_from_algebra(vel * alpha)
-            inter_pose = g.SE2.multiply(g_stop_pose, rel)
-            position, direction = g.translation_angle_from_SE2(inter_pose)
-            print(f"Adding waypoint:  position {position}, angle {direction}")
-            waypoints.append(position)
-            directions.append(direction)
+
+        # vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
+        # alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
+        # for alpha in alphas:
+        #     rel = g.SE2.group_from_algebra(vel * alpha)
+        #     inter_pose = g.SE2.multiply(g_stop_pose, rel)
+        #     position, direction = g.translation_angle_from_SE2(inter_pose)
+        #     # Prevent planning behind the stop line: clamp x >= 0 in the stop-line frame
+        #     if position[0] < 0.0:
+        #         position = np.array([0.0, position[1]])
+        #     print(f"Adding waypoint:  position {position}, angle {direction}")
+        #     waypoints.append(position)
+        #     directions.append(direction)
+
+
+        if self.turn_type == 0 and self.use_left_turn_via_point:
+            via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
+            robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), via_pose)
+
+            p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
+            rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
+
+            seg1_count = max(1, self.left_num_waypoints // 2)
+            seg2_count = max(1, self.left_num_waypoints - seg1_count)
+
+            # w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
+            # w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
+            # waypoints.extend(w1 + w2)
+            # directions.extend(d1 + d2)
+
+            vel1 = g.SE2.algebra_from_group(robot_frame_via_pose)
+            alphas1 = [x/seg1_count for x in range(1, seg1_count+1)]
+            for alpha in alphas1:
+                rel = g.SE2.group_from_algebra(vel1 * alpha)
+                inter_pose = g.SE2.multiply(g_stop_pose, rel)
+                position, direction = g.translation_angle_from_SE2(inter_pose)
+                if position[0] < 0.0:
+                    position = np.array([0.0, position[1]])
+                waypoints.append(position)
+                directions.append(direction)
+
+            rospy.loginfo(f"[unicorn_intersection_node] 0")
+            # Segment 2: Via → Goal (both in stop-line frame)
+            via_to_goal_in_stop_frame = g.SE2.multiply(
+                g.SE2.inverse(robot_frame_via_pose),  # ← Use stop-line frame via
+                robot_frame_goal_pose                  # ← goal already in stop-line frame
+            )
+            rospy.loginfo(f"[unicorn_intersection_node] 1")
+            vel2 = g.SE2.algebra_from_group(via_to_goal_in_stop_frame)
+            rospy.loginfo(f"[unicorn_intersection_node] 2")
+            alphas2 = [x/seg2_count for x in range(1, seg2_count+1)]
+            rospy.loginfo(f"[unicorn_intersection_node] 3")
+            for alpha in alphas2:
+                rel = g.SE2.group_from_algebra(vel2 * alpha)
+                # Compose: via + (alpha * via→goal displacement)
+                waypoint_in_stop_frame = g.SE2.multiply(robot_frame_via_pose, rel)
+                # Transform to world frame (matching segment 1 and other turns)
+                inter_pose = g.SE2.multiply(g_stop_pose, waypoint_in_stop_frame)
+                position, direction = g.translation_angle_from_SE2(inter_pose)
+                if position[0] < 0.0:
+                    position = np.array([0.0, position[1]])
+                rospy.loginfo(f"[unicorn_intersection_node] 4")
+                waypoints.append(position)
+                directions.append(direction)
+        else:
+            vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
+            alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
+            for alpha in alphas:
+                rel = g.SE2.group_from_algebra(vel * alpha)
+                inter_pose = g.SE2.multiply(g_stop_pose, rel)
+                position, direction = g.translation_angle_from_SE2(inter_pose)
+                # Prevent planning behind the stop line: clamp x >= 0 in the stop-line frame
+                if position[0] < 0.0:
+                    position = np.array([0.0, position[1]])
+                print(f"Adding waypoint:  position {position}, angle {direction}")
+                waypoints.append(position)
+                directions.append(direction)
+        # if self.turn_type == 0 and self.use_left_turn_via_point:
+        #     via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
+        #     robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), via_pose)
+
+        #     p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
+        #     rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
+
+        #     seg1_count = max(1, self.left_num_waypoints // 2)
+        #     seg2_count = max(1, self.left_num_waypoints - seg1_count)
+
+        #     w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
+        #     w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
+        #     waypoints.extend(w1 + w2)
+        #     directions.extend(d1 + d2)
+        # else:
+        #     w, d = self.interpolate_segment(g_stop_pose, robot_frame_goal_pose, self.num_waypoints)
+        #     waypoints.extend(w)
+        #     directions.extend(d)
 
         # Step 3 (optional): Publish the trajectory for visualization in RVIZ
         if self.visualization:
             self.visualize_trajectory(waypoints, directions)
+            self.publish_trajectory_debug_image(waypoints, directions)
         return waypoints
 
     def visualize_trajectory(self,waypoints, directions):
@@ -570,7 +669,7 @@ class UnicornIntersectionNode(DTROS):
         # Add commands to car message
         gainV = 0.75
         wayPoint = self.reference_trajectory[self.iter_]
-        car_control_msg.v = max(0.10, min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y)))
+        car_control_msg.v = max(0.1, min(self.speed, gainV*(np.cos(self.yaw)*(wayPoint[0]-self.x)+np.sin(self.yaw)*(wayPoint[1])-self.y)))
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 
@@ -687,18 +786,160 @@ class UnicornIntersectionNode(DTROS):
         """Interpolate SE(2) trajectory between two poses."""
         robot_frame_goal_pose = g.SE2.multiply(g.SE2.inverse(g_stop_pose), end_pose)
         vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
-        alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
+        alphas = [x/num_points for x in range(1, num_points+1)]
         waypoints = []
         directions = []
         for alpha in alphas:
             rel = g.SE2.group_from_algebra(vel * alpha)
             inter_pose = g.SE2.multiply(g_stop_pose, rel)
             position, direction = g.translation_angle_from_SE2(inter_pose)
+            # Prevent planning behind the stop line: clamp x >= 0 in the stop-line frame
+            if position[0] < 0.0:
+                position = np.array([0.0, position[1]])
             print(f"Adding waypoint:  position {position}, angle {direction}")
             waypoints.append(position)
             directions.append(direction)
 
         return waypoints, directions
+
+    def publish_trajectory_debug_image(self, waypoints, directions):
+        """
+        Create and publish a debug image showing the trajectory waypoints and path
+        """
+        # Create a blank image (800x800 pixels, white background)
+        img_size = 800
+        img = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
+
+        # Scale factor to convert meters to pixels (adjust based on typical trajectory size)
+        # Assuming trajectories are roughly -1 to 1 meters, we'll use center of image as origin
+        scale = 200  # pixels per meter
+        center_x = img_size // 2
+        center_y = img_size // 2
+
+        def to_pixel_coords(point):
+            """Convert from meters (robot frame) to pixel coordinates"""
+            px = int(center_x + point[0] * scale)
+            py = int(center_y - point[1] * scale)  # Flip y-axis for image coordinates
+            return (px, py)
+
+        # Draw grid lines for reference
+        grid_step = 0.25  # meters
+        for i in np.arange(-2, 2.1, grid_step):
+            # Vertical lines
+            x_px = int(center_x + i * scale)
+            cv2.line(img, (x_px, 0), (x_px, img_size), (230, 230, 230), 1)
+            # Horizontal lines
+            y_px = int(center_y - i * scale)
+            cv2.line(img, (0, y_px), (img_size, y_px), (230, 230, 230), 1)
+
+        # Draw axes
+        cv2.line(img, (center_x, 0), (center_x, img_size), (200, 200, 200), 2)  # Y-axis
+        cv2.line(img, (0, center_y), (img_size, center_y), (200, 200, 200), 2)  # X-axis
+
+        # Draw an intersection layout similar to simulation: red stop lines on each approach,
+        # yellow center lines through the intersection.
+        stop_offset = 0.585 / 2.0  # distance from center to each stop line
+        stop_len = 0.585 / 2.0
+        stop_half = stop_len / 2.0
+        x_offset = 0.585 / 2.0
+        y_offset = 0.585 / 4.0
+
+        def draw_stop_line(cx, cy, heading, color, thickness=3):
+            dx = stop_half * np.cos(heading + np.pi / 2)
+            dy = stop_half * np.sin(heading + np.pi / 2)
+            p1 = to_pixel_coords((cx - dx + x_offset, cy - dy))
+            p2 = to_pixel_coords((cx + dx + x_offset, cy + dy))
+            cv2.line(img, p1, p2, color, thickness)
+
+        # Stop lines (red) for four approaches
+        draw_stop_line(-x_offset, -stop_half + y_offset, 0.0, (0, 0, 255))         # coming from left
+        draw_stop_line(x_offset, stop_half + y_offset, np.pi, (0, 0, 255))        # coming from right
+        draw_stop_line(stop_half, -stop_offset + y_offset, np.pi / 2, (0, 0, 255))   # coming from bottom
+        draw_stop_line(-stop_half, stop_offset + y_offset, -np.pi / 2, (0, 0, 255))   # coming from top
+
+        # Center lines (yellow) extending away from the center
+        center_len = 0.5
+        center_color = (0, 255, 255)
+
+        cv2.line(img, to_pixel_coords((x_offset*2, y_offset)), to_pixel_coords((center_len + x_offset*2, y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((0.0, y_offset)), to_pixel_coords((-center_len, y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((x_offset, stop_offset + y_offset)), to_pixel_coords((x_offset, stop_offset + center_len + y_offset)), center_color, 2)
+        cv2.line(img, to_pixel_coords((x_offset, -y_offset)), to_pixel_coords((x_offset, -center_len - y_offset)), center_color, 2)
+
+        # Draw robot position(s) (transformed into stop-line frame for visualization)
+        if self.g_stop_pose_plan is not None:
+            stop_T_robot = g.SE2.multiply(
+                g.SE2.inverse(self.g_stop_pose_plan),
+                g.SE2_from_xytheta([self.x, self.y, self.yaw]),
+            )
+            stop_T_robot_rel = g.SE2.multiply(g.SE2.inverse(self.g_stop_pose_plan), stop_T_robot)
+            norm_pos, norm_heading = g.translation_angle_from_SE2(stop_T_robot_rel)
+            norm_px = to_pixel_coords(norm_pos)
+            cv2.circle(img, norm_px, 12, (0, 200, 0), -1)  # Pale green
+            arrow_length = 30
+            end_x = int(norm_px[0] + arrow_length * np.cos(norm_heading))
+            end_y = int(norm_px[1] - arrow_length * np.sin(norm_heading))
+            cv2.arrowedLine(img, norm_px, (end_x, end_y), (180, 230, 180), 2, tipLength=0.3)
+            cv2.putText(img, "Duckiebot", (norm_px[0] - 20, norm_px[1] - 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 120, 80), 2)
+
+        # Draw ideal trajectory path (connecting lines) - what's planned
+        if len(waypoints) > 1:
+            for i in range(len(waypoints) - 1):
+                pt1 = to_pixel_coords(waypoints[i])
+                pt2 = to_pixel_coords(waypoints[i + 1])
+                cv2.line(img, pt1, pt2, (255, 0, 0), 3)  # Blue line for ideal trajectory
+
+        # Draw waypoints with direction arrows
+        for i, (wp, direction) in enumerate(zip(waypoints, directions)):
+            pixel_pos = to_pixel_coords(wp)
+
+            # Draw waypoint circle
+            color = (0, 0, 255) if i < len(waypoints) - 1 else (255, 0, 255)  # Red for waypoints, magenta for final
+            cv2.circle(img, pixel_pos, 8, color, -1)
+
+            # Draw direction arrow
+            arrow_length = 30
+            end_x = int(pixel_pos[0] + arrow_length * np.cos(direction))
+            end_y = int(pixel_pos[1] - arrow_length * np.sin(direction))  # Flip y for image coords
+            cv2.arrowedLine(img, pixel_pos, (end_x, end_y), color, 2, tipLength=0.3)
+
+            # Add waypoint number
+            cv2.putText(img, str(i), (pixel_pos[0] + 10, pixel_pos[1] - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
+        # Add title and information
+        turn_type_str = {0: "LEFT", 1: "STRAIGHT", 2: "RIGHT"}.get(self.turn_type, "UNKNOWN")
+        cv2.putText(img, f"Intersection Trajectory - Turn: {turn_type_str}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+        cv2.putText(img, f"Waypoints: {len(waypoints)}", (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+        # Add legend
+        legend_y = 30
+        cv2.circle(img, (img_size - 150, legend_y), 8, (0, 0, 255), -1)
+        cv2.putText(img, "Waypoint", (img_size - 130, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        legend_y += 20
+        cv2.circle(img, (img_size - 150, legend_y), 8, (255, 0, 255), -1)
+        cv2.putText(img, "Goal", (img_size - 130, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        legend_y += 20
+        cv2.line(img, (img_size - 155, legend_y), (img_size - 145, legend_y), (255, 0, 0), 3)
+        cv2.putText(img, "Ideal Traj", (img_size - 130, legend_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+
+        # Convert to ROS CompressedImage message
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        msg.data = np.array(cv2.imencode('.jpg', img)[1]).tobytes()
+
+        # Publish the debug image
+        self.pub_debug_trajectory_img.publish(msg)
+        rospy.loginfo(f"[{self.node_name}] Published trajectory debug image with {len(waypoints)} waypoints")
     
     def shortest_angle(self, theta):
         """Wrap angle to [-pi, pi]."""
