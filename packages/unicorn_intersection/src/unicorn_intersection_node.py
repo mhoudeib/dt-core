@@ -447,20 +447,6 @@ class UnicornIntersectionNode(DTROS):
         waypoints = []
         directions = []
 
-        # vel = g.SE2.algebra_from_group(robot_frame_goal_pose)
-        # alphas = [x/self.num_waypoints for x in range(1, self.num_waypoints+1)]
-        # for alpha in alphas:
-        #     rel = g.SE2.group_from_algebra(vel * alpha)
-        #     inter_pose = g.SE2.multiply(g_stop_pose, rel)
-        #     position, direction = g.translation_angle_from_SE2(inter_pose)
-        #     # Prevent planning behind the stop line: clamp x >= 0 in the stop-line frame
-        #     if position[0] < 0.0:
-        #         position = np.array([0.0, position[1]])
-        #     print(f"Adding waypoint:  position {position}, angle {direction}")
-        #     waypoints.append(position)
-        #     directions.append(direction)
-
-
         if self.turn_type == 0 and self.use_left_turn_via_point:
             via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
             robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), via_pose)
@@ -470,11 +456,6 @@ class UnicornIntersectionNode(DTROS):
 
             seg1_count = max(1, self.left_num_waypoints // 2)
             seg2_count = max(1, self.left_num_waypoints - seg1_count)
-
-            # w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
-            # w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
-            # waypoints.extend(w1 + w2)
-            # directions.extend(d1 + d2)
 
             vel1 = g.SE2.algebra_from_group(robot_frame_via_pose)
             alphas1 = [x/seg1_count for x in range(1, seg1_count+1)]
@@ -490,8 +471,8 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo(f"[unicorn_intersection_node] 0")
             # Segment 2: Via → Goal (both in stop-line frame)
             via_to_goal_in_stop_frame = g.SE2.multiply(
-                g.SE2.inverse(robot_frame_via_pose),  # ← Use stop-line frame via
-                robot_frame_goal_pose                  # ← goal already in stop-line frame
+                g.SE2.inverse(robot_frame_via_pose),  # Use stop-line frame via
+                robot_frame_goal_pose                  # goal already in stop-line frame
             )
             rospy.loginfo(f"[unicorn_intersection_node] 1")
             vel2 = g.SE2.algebra_from_group(via_to_goal_in_stop_frame)
@@ -523,24 +504,6 @@ class UnicornIntersectionNode(DTROS):
                 print(f"Adding waypoint:  position {position}, angle {direction}")
                 waypoints.append(position)
                 directions.append(direction)
-        # if self.turn_type == 0 and self.use_left_turn_via_point:
-        #     via_pose = self.dictionary_pose_to_geometry(self.left_turn_via_point)
-        #     robot_frame_via_pose = g.SE2.multiply( g.SE2.inverse(g_stop_pose), via_pose)
-
-        #     p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
-        #     rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
-
-        #     seg1_count = max(1, self.left_num_waypoints // 2)
-        #     seg2_count = max(1, self.left_num_waypoints - seg1_count)
-
-        #     w1, d1 = self.interpolate_segment(g_stop_pose, robot_frame_via_pose, seg1_count)
-        #     w2, d2 = self.interpolate_segment(robot_frame_via_pose, robot_frame_goal_pose, seg2_count)
-        #     waypoints.extend(w1 + w2)
-        #     directions.extend(d1 + d2)
-        # else:
-        #     w, d = self.interpolate_segment(g_stop_pose, robot_frame_goal_pose, self.num_waypoints)
-        #     waypoints.extend(w)
-        #     directions.extend(d)
 
         # Step 3 (optional): Publish the trajectory for visualization in RVIZ
         if self.visualization:

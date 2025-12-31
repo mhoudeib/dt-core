@@ -3,7 +3,7 @@
 
 <p align="center">
 <a href="https://duckietown.com">
-<img src="/assets/images/dtlogo.png" alt="Duckietown Logo" width="50%">
+<img src="assets/images/dtlogo.png" alt="Duckietown Logo" width="50%">
 </a>
 </p>
 
@@ -16,7 +16,15 @@
 - Guillaume Genois  
 - Mohamad Houdeib  
 
-**TODO:** Insert a high-quality GIF or screenshot of the Duckiebot driving indefinitely through intersections.
+<p align="center">
+  <video src="assets/demo.webm" width="70%" autoplay loop muted playsinline>
+    Your browser does not support the video tag.
+  </video>
+</p>
+
+<!-- <p align="center">
+  <img src="assets/images/overview.png" alt="Project Overview Diagram" width="80%">
+</p> -->
 
 ---
 
@@ -29,7 +37,7 @@ dts devel build -H [YOURBOTNAME]
 dts devel run -H [YOURBOTNAME] -M -L single_robot_indefinite_navigation
 dts duckiebot keyboard_control [YOURBOTNAME]
 ```
-After this, click the autopilot toggle in the keyboard_control window; this will launch the autonomous drive.
+After this, click the autopilot toggle in the keyboard_control window; this will launch the autonomous drive. Wait until the light pattern changed to GREEN.
 
 Using
 ```bash
@@ -60,7 +68,7 @@ and view the Apriltags being captured on:
 
 Autonomous navigation in structured environments such as DuckieTown is often demonstrated on finite scenarios: a fixed map, a single intersection, or a limited number of maneuvers. However, indefinite navigation, where a robot can continuously drive, cross intersections, and return to lane following without manual resets, remains challenging due to accumulated perception errors, unstable state transitions, and unreliable intersection handling.
 
-The objective of this project is to enable a Duckiebot to drive indefinitely in a DuckieTown environment with intersections **without traffic lights, by robustly detecting stop lines, interpreting intersection signs, planning trajectories, and safely transitioning back to lane following.
+The objective of this project is to enable a Duckiebot to drive indefinitely in a DuckieTown environment with intersections without traffic lights, by robustly detecting stop lines, interpreting intersection signs, planning trajectories, and safely transitioning back to lane following.
 
 Concretely, we focus on the LF-I_noTL scenario (single robot, no traffic lights), which requires:
 - Reliable stop line detection
@@ -68,9 +76,9 @@ Concretely, we focus on the LF-I_noTL scenario (single robot, no traffic lights)
 - Safe and stable intersection crossing
 - Robust state switching to avoid deadlocks or oscillations
 
-![System Behaviors Hierarchy](src/_images/auto-behaviors-hierarchy.png)
+![System Behaviors Hierarchy](assets/images/auto-behaviors-hierarchy.png)
 
-This work serves as a foundation toward multi-robot indefinite navigation (LF-IV), where decentralized coordination becomes necessary :contentReference[oaicite:0]{index=0}.
+This work serves as a foundation toward multi-robot indefinite navigation (LF-IV), where decentralized coordination becomes necessary.
 
 ---
 
@@ -101,31 +109,16 @@ Our work consists of extending the standard DuckieTown autonomy stack. This stac
 5. **Intersection Control**
 6. **Return to Lane Following**
 
-**TODO:** add figure as in presentation. 
+<img src="assets/images/architecture.png" alt="High-Level Architecture" width="800"/>
 
 
 ---
 
 ### Stop Line Detection
 
-**Goal:** Detect red stop lines and estimate the robot’s pose relative to them.
+The goal of the stop line detection module is to identify red stop lines on the road and estimate the robot’s position relative to them. The system receives as input a set of red line segments detected by the vision pipeline, along with the lane pose estimate `(d, φ)` provided by the lane filter. The detection process begins by filtering out any red segments that fall outside the boundaries of the lane. The remaining segment endpoints are then transformed into the lane frame of reference, allowing for a more accurate spatial interpretation. By aggregating the distances of these valid segments, the system estimates the position of the stop line. To ensure reliable detection, it requires a minimum number of consistent observations before confirming the presence of a stop line.
 
-**Inputs:**
-- Red line segments from vision
-- Lane pose estimate `(d, φ)` from the lane filter
-
-**Methodology:**
-- Reject red segments outside lane boundaries
-- Transform segment endpoints into the lane frame
-- Aggregate segment distances to estimate stop line position
-- Require a minimum number of consistent detections
-
-To improve robustness, we apply:
-- Median smoothing over recent distance estimates
-- Hysteresis with separate enter/exit thresholds
-- Multi-frame confirmation to prevent flickering states
-
-This significantly stabilizes the `at_stop_line` condition and avoids false exits :contentReference[oaicite:3]{index=3}.
+To enhance the robustness of detection, several techniques are applied. First, median smoothing is performed over recent distance estimates to reduce the influence of outliers. The system also implements hysteresis, maintaining separate thresholds for entering and exiting the stop line state to prevent rapid switching caused by noise or transient errors. Finally, the detection must be confirmed across multiple frames, which helps avoid false positives and eliminates flickering between states. These combined strategies lead to a much more stable and reliable `at_stop_line` condition for state transitions, effectively preventing premature or incorrect state changes.
 
 ---
 
@@ -158,7 +151,7 @@ $$
 
 This control law required the tuning of two gains to work properly in real conditions.
 
-This decoupled control scheme allows smooth execution of complex intersection maneuvers : contentReference[oaicite:4]{index=4}.
+This decoupled control scheme allows smooth execution of complex intersection maneuvers.
 
 ---
 
@@ -170,25 +163,31 @@ The robot occasionally planned paths that drifted into the opposite lane.
 
 A practical solution we implemented was to introduce a via point into the trajectory planning process. This via point helps guide the robot further into the intersection before it begins turning, ensuring that the path remains within the correct lane and reducing the chance of drifting into the opposite lane. Additionally, we adjusted the number of waypoints used for each maneuver: left turns are assigned more waypoints for smoothness and precision, while right turns use fewer waypoints, as they require less steering effort.
 
-![Generated intersection trajectory](src/_images/generated-trajectory.jpeg)
+![Generated intersection trajectory](assets/images/trajectory.jpeg)
 
 ---
 
 ### Multi-Frame Trajectory Handling
 
-A critical challenge in intersection navigation was managing multiple coordinate frames correctly. Originally, waypoints were computed in the robot frame relative to the stop line, but this approach caused significant drift during execution as the robot moved.
+A critical challenge in intersection navigation was managing multiple coordinate frames correctly. The implementation uses a stop-line-relative planning approach where waypoints are generated in the robot's coordinate frame at planning time, using the stop line pose as a stable reference.
 
-When waypoints are computed in the robot's current frame and the robot moves, those waypoints become stale. The robot would either skip waypoints, stop prematurely, or drift off the intended path.
+The trajectory planning process works as follows:
 
-We implemented a multi-frame approach that separates planning from execution:
+**Planning Phase:**
+1. The stop line pose is detected relative to the robot's current position. This pose is stored with theta set to 0.0 (assuming the robot is aligned with the stop line).
+2. Canonical goal poses are defined in the stop-line coordinate frame for left, right, and straight maneuvers.
+3. The goal pose is transformed from the stop-line frame to the robot frame using `robot_frame_goal_pose = inverse(g_stop_pose) × canonical_goal_pose`, where `g_stop_pose` represents the stop line pose relative to the robot.
+4. For left turns with via-point enabled, the trajectory is split into two segments:
+   - Segment 1: Interpolates from the stop line to the via-point (both transformed to robot frame using the same transformation)
+   - Segment 2: Interpolates from the via-point to the goal pose (computed in stop-line frame, then transformed to robot frame)
+5. For other maneuvers, waypoints are generated by interpolating along the trajectory from the stop line to the goal pose in the robot frame, using SE(2) Lie algebra interpolation.
+6. All waypoints are clamped to prevent planning behind the stop line (x ≥ 0 in the stop-line frame).
 
-In the planning frame, also called the stop-line frame, waypoints are generated relative to the detected stop line pose. Using the stop line as a reference provides a stable, world-fixed coordinate system for planning. Goal poses for the robot are blended between canonical targets and those adjusted by the stop line pose to help reduce over-correction. For left turns, a via-point is additionally inserted so that the robot enters further into the intersection before beginning its turn, encouraging safer and more accurate maneuvering.
-
-When planning occurs, the robot's current pose is used to transform the planned waypoints from the robot frame into the odometry frame. This transformation effectively "freezes" the waypoints at the planning moment, such that each odometry-frame waypoint is computed as `waypoint_odom = odom_T_robot × waypoint_robot`. During execution, the robot tracks its pose in the odometry frame using dead reckoning from wheel encoders. Because waypoint checking also occurs in the odometry frame, this approach prevents drift that could otherwise result from moving frames of reference.
-
+**Execution Phase:**
+The waypoints generated during planning are in the robot's coordinate frame at the moment of planning. During execution, the robot tracks its position using dead reckoning from wheel encoders. The waypoints are compared directly with the robot's odometry coordinates, effectively using the robot's planning-time frame as the execution reference frame.
 
 **Benefits:**
-Waypoints remain fixed in the global odometry frame, eliminating the accumulation of frame transformation errors as the robot moves. This provides consistent and reliable waypoint referencing throughout the maneuver. The waypoint reaching logic is made robust by decomposing the robot’s position error into along-track and cross-track components, which helps prevent skipping waypoints prematurely and avoids oscillatory behavior during trajectory execution.
+Using the stop line as a reference point provides a stable frame for planning that adapts to the robot's position at the intersection. The waypoint reaching logic is made robust by decomposing the robot's position error into along-track and cross-track components, which helps prevent skipping waypoints prematurely and avoids oscillatory behavior during trajectory execution.
 
 ---
 
@@ -249,11 +248,11 @@ Our short range vehicle to vehicle communication protocol is based on SAE's J273
 
 - **Front Right (LED 4):** Direction or ready state
 
-| Index | Color | Planned Trajectory | 
-| :--- | :--- | :--- | 
-| 0 | ![](https://img.shields.io/badge/-%2300FFFF?style=flat-square&labelColor=%2300FFFF) | Turning Left | 
-| 1 | 🟨 | Going Straight | 
-| 2 | ![](https://img.shields.io/badge/-%23FFC0CB?style=flat-square&labelColor=%23FFC0CB) | Turning Right |
+| Index | Color | Planned Trajectory |
+| :--- | :--- | :--- |
+| 0 | Cyan | Turning Left |
+| 1 | 🟨 Yellow | Going Straight |
+| 2 | Pink | Turning Right |
 
 - **State Sequence:**
 
