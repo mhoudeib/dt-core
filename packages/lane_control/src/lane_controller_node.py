@@ -265,7 +265,7 @@ class LaneControllerNode(DTROS):
             distMin = self.params["~stop_line_slowdown"]['end']#minimun distance to the stop ligne
             distMax = self.params["~stop_line_slowdown"]['start']#distance to the stop when the robot start decreasing
             distToStop = self.stop_line_distance
-            factor = max(0, (distToStop-distMin)/(distMax-distMin))
+            factor = max(0, min(1, (distToStop-distMin)/(distMax-distMin)))
 
         # Add commands to car message
         car_control_msg.v = factor*v
