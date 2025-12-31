@@ -495,10 +495,6 @@ class UnicornIntersectionNode(DTROS):
             self.right_encoder_last = right_encoder
             self.encoders_timestamp_last = timestamp
             self.encoders_timestamp_last_local = timestamp_now
-            # Only run trajectory tracking when executing
-            if self.internal_state != "EXECUTING":
-                return
-
 
         # Skip this message if the time synchronizer gave us an older message
         dtl = left_encoder.header.stamp - self.left_encoder_last.header.stamp
@@ -556,6 +552,10 @@ class UnicornIntersectionNode(DTROS):
         self.encoders_timestamp_last = timestamp
         self.encoders_timestamp_last_local = timestamp_now
 
+        # Only run trajectory tracking when executing
+        if self.internal_state != "EXECUTING":
+            return
+
         car_control_msg = Twist2DStamped()
         #TODO
         car_control_msg.header.stamp = rospy.Time.now()
@@ -568,7 +568,12 @@ class UnicornIntersectionNode(DTROS):
         car_control_msg.omega = self.compute_omega(self.reference_trajectory[self.iter_],self.x,self.y,self.yaw,dt)
         self.car_cmd.publish(car_control_msg)
 
-        if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_] ):
+        # Get previous waypoint for along-track/cross-track check
+        prev_point = None
+        if self.iter_ > 0:
+            prev_point = self.reference_trajectory[self.iter_ - 1]
+
+        if self.check_point( np.array([self.x,self.y]),self.reference_trajectory[self.iter_], prev_point):
             if self.iter_ == 0:
                 self.update_leds(['yellow', 'yellow', 'yellow', 'yellow', 'yellow']) #LED message to broadcast intersection navigation in progress
             self.iter_ += 1
@@ -590,8 +595,6 @@ class UnicornIntersectionNode(DTROS):
                 self.current_led_pattern = None
                 self.current_led_pattern_type = None
                 rospy.loginfo("[unicorn intersection node] intersection navigation complete")
-
-
 
 
     @staticmethod
@@ -661,7 +664,7 @@ class UnicornIntersectionNode(DTROS):
     def setupParam(self, param_name, default_value):
         value = rospy.get_param(param_name, default_value)
         rospy.set_param(param_name, value)  # Write to parameter server for transparancy
-        rospy.loginfo(f"[{self.node_name}] {param_name} = {value} ")
+        #rospy.loginfo(f"[{self.node_name}] {param_name} = {value} ")
         return value
 
     def onShutdown(self):
@@ -713,12 +716,14 @@ class UnicornIntersectionNode(DTROS):
 
         return omega
 
-    def check_point(self, current_point, target_point):
+    def check_point(self, current_point, target_point, prev_point = None):
         threshold = 0.1
         threshold_x = 0.08
         dist_x = np.zeros((1,2))
         dist_x[0, 0] = (current_point[0] - self.alpha) - target_point[0]
         dist_x[0, 1] = (current_point[1]) - target_point[1]
+        current_x = current_point[0]
+        current_y = current_point[1]
         if self.iter_ == (self.num_waypoints - 1):
             # Last waypoint: check if close enough or if passed it along travel direction
             dist = np.sqrt((current_x - target_point[0])**2 + (current_y - target_point[1])**2)
@@ -747,7 +752,7 @@ class UnicornIntersectionNode(DTROS):
                     s = v_x * t_x + v_y * t_y
                     # Advance if passed the waypoint along travel direction
                     if s >= seg_length:
-                        rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, s: {s}, seg_length: {seg_length}")
+                        #rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, s: {s}, seg_length: {seg_length}")
                         return True
 
                     # print -np.sign(target_point[0] - self.reference_trajectory[0][0]) * (current_x - target_point[0]) > threshold_x
@@ -755,7 +760,7 @@ class UnicornIntersectionNode(DTROS):
                     signed_overrun = direction * (current_x - target_point[0])
 
                     if signed_overrun > threshold_x:
-                        rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, overrun_x: {signed_overrun:.3f}, threshold_x: {threshold_x}")
+                        #rospy.loginfo(f"[{self.node_name}] Reached waypoint {self.iter_}, overrun_x: {signed_overrun:.3f}, threshold_x: {threshold_x}")
                         return True
             return False
 
@@ -771,7 +776,7 @@ class UnicornIntersectionNode(DTROS):
             if np.sqrt(target_point[0]**2 + target_point[1]**2) < 0.05:  # waypoint within 5cm of origin
                 # For near-origin waypoints, just use distance check with relaxed threshold
                 if dist < threshold * 1.5:
-                    rospy.loginfo(f"[{self.node_name}] Near-origin waypoint, dist: {dist:.3f}, relaxed threshold: {threshold * 1.5:.3f}")
+                    #rospy.loginfo(f"[{self.node_name}] Near-origin waypoint, dist: {dist:.3f}, relaxed threshold: {threshold * 1.5:.3f}")
                     return True
 
             # If no previous point, fall back to distance check only
@@ -788,7 +793,7 @@ class UnicornIntersectionNode(DTROS):
             if seg_length < 1e-6:
                 # If segment is degenerate, just check distance to target
                 if dist < threshold * 1.2:
-                    rospy.loginfo(f"[{self.node_name}] Degenerate segment, using distance check")
+                    #rospy.loginfo(f"[{self.node_name}] Degenerate segment, using distance check")
                     return True
                 return False
 
@@ -839,7 +844,7 @@ class UnicornIntersectionNode(DTROS):
             self.led_pattern_service(pattern_name=pattern_msg)
             self.current_led_pattern = pattern_name
             self.current_led_pattern_type = 'predefined'
-            rospy.loginfo(f"[{self.node_name}] Set LED pattern to: {pattern_name}")
+            #rospy.loginfo(f"[{self.node_name}] Set LED pattern to: {pattern_name}")
         except rospy.ServiceException as e:
             rospy.logerr(f"[{self.node_name}] Failed to set LED pattern {pattern_name}: {e}")
 
@@ -873,7 +878,7 @@ class UnicornIntersectionNode(DTROS):
             self.led_custom_pattern_service(pattern=pattern_msg)
             self.current_led_pattern = normalized_pattern
             self.current_led_pattern_type = 'custom'
-            rospy.loginfo(f"[{self.node_name}] Set custom LED pattern: {color_list}")
+            #rospy.loginfo(f"[{self.node_name}] Set custom LED pattern: {color_list}")
         except rospy.ServiceException as e:
             rospy.logerr(f"[{self.node_name}] Failed to set custom LED pattern: {e}")
 
