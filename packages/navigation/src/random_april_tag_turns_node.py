@@ -176,7 +176,7 @@ class RandomAprilTagTurnsNode(DTROS):
                     availableTurns = [0, 1, 2]
                 elif signType == taginfo.T_INTERSECTION:
                     availableTurns = [0, 2]
-                rospy.loginfo(f"[{self.node_name}] reports Available turns are: [{availableTurns}]")
+                rospy.loginfo(f"[{self.node_name}] reports Available turns are: [{availableTurns}] from tag {taginfo.id}")
                 # now randomly choose a possible direction
                 if len(availableTurns) > 0:
                     randomIndex = numpy.random.randint(len(availableTurns))
