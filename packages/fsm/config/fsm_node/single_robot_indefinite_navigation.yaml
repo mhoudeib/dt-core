@@ -71,6 +71,7 @@ states:
       - ground_projection_node
       - anti_instagram
       - led_emitter_node
+      - unicorn_intersection_node
 #      - apriltag_detector_node
 #      - apriltag_postprocessing_node
     lights: "GREEN"

@@ -134,8 +134,48 @@ class UnicornIntersectionNode(DTROS):
         self.negotiation_end = False
         self.led_priority_set = False
         self.led_ready_set = False
+        self.apriltag_detections = {}
 
         self.log("Initialialized unicorn intersection node")
+
+    def onFSMStateChange(self, msg):
+        """
+        Callback for FSM state changes. Reset odometry and state when switching to joystick control.
+        This is automatically called by DTROS when fsm_controlled=True.
+        """
+        new_state = msg.state
+        rospy.loginfo(f"[{self.node_name}] FSM state changed to: {new_state}")
+
+        # Reset odometry and state when switching to joystick control
+        if new_state == "NORMAL_JOYSTICK_CONTROL":
+            rospy.loginfo(f"[{self.node_name}] Switching to joystick control - resetting state")
+            self.reset_odometry()
+            # Reset intersection state so it can recalculate trajectory when returning to autopilot
+            self.internal_state = "READY"
+            self.stop_line_pose_received = False
+            self.turn_type_received = False
+            self.g_stop_pose_plan = None
+            self.stop_frame_robot_ref = None
+            self.priority_level = 0
+            self.negotiation_end = False
+            self.led_priority_set = False
+            self.led_ready_set = False
+            self.current_led_pattern = None
+            self.current_led_pattern_type = None
+            self.stop_line_pose = Pose2D()
+            self.apriltag_detections = {}
+
+        elif new_state == "INTERSECTION_CONTROL":
+            # Re-apply LED pattern when entering intersection control
+            if self.current_led_pattern is not None:
+                rospy.loginfo(f"[{self.node_name}] Re-applying LED pattern after FSM state change")
+                rospy.Timer(rospy.Duration(0.3), lambda event: self._reapply_led_pattern(), oneshot=True)
+            # Start periodic re-application timer during execution
+            if self.internal_state == "EXECUTING" and self.current_led_pattern is not None:
+                self._start_led_pattern_timer()
+        elif new_state != "INTERSECTION_CONTROL":
+            # Stop LED pattern timer when leaving intersection control
+            self._stop_led_pattern_timer()
     
     def cbStopLineReading(self, msg):
         if self.stop_line_pose_received:
@@ -184,10 +224,10 @@ class UnicornIntersectionNode(DTROS):
         if len(msg.detections) == 0:
             return
 
-        self.apriltag_detections = {}
-
         for detection in msg.detections:
             self.apriltag_detections[detection.tag_id] = detection
+            rospy.loginfo(f"[{self.node_name}] Detected tag {detection.tag_id}")
+            rospy.loginfo(detection)
     
     def _scan_for_apriltag(self, tag_id):
         """
@@ -258,7 +298,7 @@ class UnicornIntersectionNode(DTROS):
     def align_to_apriltag_heading(self):
         """Rotate robot to align parallel with the Apriltag's x-axis before executing."""
         # TODO: sometimes the wrong tag is being chosen as target
-        
+
         tag_id = self.turn_tag_id
         if tag_id is None:
             rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but no tag_id provided with turn_type.")
@@ -331,6 +371,10 @@ class UnicornIntersectionNode(DTROS):
             rospy.loginfo(f"[{self.node_name}] Option 2: {yaw_option_2:.3f} rad ({np.degrees(yaw_option_2):.1f} deg), error: {error_2:.3f} rad ({np.degrees(error_2):.1f} deg)")
             rospy.loginfo(f"[{self.node_name}] Selected desired yaw (before offset): {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
 
+        if abs(desired_yaw) > np.pi/2:
+            rospy.logwarn(f"[{self.node_name}] Desired yaw is too large, cannot align to AprilTag")
+            return
+
         start_time = rospy.Time.now()
         rate = rospy.Rate(20)
 
@@ -367,6 +411,7 @@ class UnicornIntersectionNode(DTROS):
     # goal pose relative to the stop line. If not using the stop line then we can use some fixed offset based on the
     # stop line distance? TODO
     def calculate_goal_trajectory(self):
+        self.stop_line_pose.theta = 0.0 # assumes robot is aligned
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
         # TODO what if we don't want to use the stop_pose?
 
