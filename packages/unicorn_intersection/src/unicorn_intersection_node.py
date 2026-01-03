@@ -152,38 +152,14 @@ class UnicornIntersectionNode(DTROS):
         self.log("Initialialized unicorn intersection node")
 
     def onFSMStateChange(self, msg):
-        """
-        Callback for FSM state changes. Reset odometry and state when switching to joystick control.
-        This is automatically called by DTROS when fsm_controlled=True.
-        """
+        """Handle FSM state transitions and reset node state accordingly."""
         new_state = msg.state
-        self.fsm_state = new_state  # Store current FSM state
+        self.fsm_state = new_state
         rospy.loginfo(f"[{self.node_name}] FSM state changed to: {new_state}")
 
-        # Reset odometry and state when switching to joystick control
         if new_state == "NORMAL_JOYSTICK_CONTROL":
-            rospy.loginfo(f"[{self.node_name}] Switching to joystick control - resetting state")
-            self.reset_odometry()
-            # Reset intersection state so it can recalculate trajectory when returning to autopilot
-            self.internal_state = "READY"
-            self.stop_line_pose_received = False
-            self.turn_type_received = False
-            self.g_stop_pose_plan = None
-            self.priority_level = 0
-            self.negotiation_end = False
-            self.led_priority_set = False
-            self.led_ready_set = False
-            self.current_led_pattern = None
-            self.current_led_pattern_type = None
-            self.stop_line_pose = Pose2D()
-            self.apriltag_detections = {}
-            self.validated_tag_detection = None  # Clear validated tag
-            self.reference_trajectory = []  # Clear old trajectory
-            self.iter_ = 0  # Reset waypoint iterator
-
-        elif new_state == "LANE_FOLLOWING":
-            # Reset everything when returning to autopilot from joystick mode
-            rospy.loginfo(f"[{self.node_name}] Returning to autopilot (LANE_FOLLOWING) - full reset")
+            # Reset all state when entering joystick mode
+            rospy.loginfo(f"[{self.node_name}] Entering joystick control - resetting state")
             self.reset_odometry()
             self.internal_state = "READY"
             self.stop_line_pose_received = False
@@ -198,38 +174,53 @@ class UnicornIntersectionNode(DTROS):
             self.stop_line_pose = Pose2D()
             self.apriltag_detections = {}
             self.validated_tag_detection = None
-            self.reference_trajectory = []  # Clear old trajectory
-            self.iter_ = 0  # Reset waypoint iterator
-            # Stop any wheel commands that might be stuck
+            self.reference_trajectory = []
+            self.iter_ = 0
+
+        elif new_state == "LANE_FOLLOWING":
+            # Full reset when returning to autopilot
+            rospy.loginfo(f"[{self.node_name}] Returning to autopilot - full reset")
+            self.reset_odometry()
+            self.internal_state = "READY"
+            self.stop_line_pose_received = False
+            self.turn_type_received = False
+            self.g_stop_pose_plan = None
+            self.priority_level = 0
+            self.negotiation_end = False
+            self.led_priority_set = False
+            self.led_ready_set = False
+            self.current_led_pattern = None
+            self.current_led_pattern_type = None
+            self.stop_line_pose = Pose2D()
+            self.apriltag_detections = {}
+            self.validated_tag_detection = None
+            self.reference_trajectory = []
+            self.iter_ = 0
+
+            # Clear any stale wheel commands
             stop_cmd = Twist2DStamped()
             stop_cmd.header.stamp = rospy.Time.now()
             stop_cmd.v = 0.0
             stop_cmd.omega = 0.0
             self.car_cmd.publish(stop_cmd)
-            rospy.loginfo(f"[{self.node_name}] Published stop command and reset all state")
 
         elif new_state == "INTERSECTION_CONTROL":
-            # Re-apply LED pattern when entering intersection control
+            # Re-apply LED pattern after FSM transition
             if self.current_led_pattern is not None:
-                rospy.loginfo(f"[{self.node_name}] Re-applying LED pattern after FSM state change")
                 rospy.Timer(rospy.Duration(0.3), lambda event: self._reapply_led_pattern(), oneshot=True)
-            # Start periodic re-application timer during execution
             if self.internal_state == "EXECUTING" and self.current_led_pattern is not None:
                 self._start_led_pattern_timer()
-        elif new_state != "INTERSECTION_CONTROL":
-            # Stop LED pattern timer when leaving intersection control
+        else:
             self._stop_led_pattern_timer()
     
     def cbStopLineReading(self, msg):
-        # Ignore stop line detections in joystick mode
+        """Process stop line detections from stop_line_filter_node."""
         if self.fsm_state == "NORMAL_JOYSTICK_CONTROL":
             return
 
         if self.stop_line_pose_received:
             return
 
-        # Accept stop line reading when at_stop_line is True
-        # Note: stop_pose.theta can legitimately be 0.0 if robot is perfectly aligned
         if msg.at_stop_line:
             # Validate that the stop line pose is reasonable (not at origin)
             # A stop line at exactly (0, 0) is likely invalid/stale
@@ -239,38 +230,31 @@ class UnicornIntersectionNode(DTROS):
 
             self.stop_line_pose = msg.stop_pose
             self.stop_line_pose_received = True
-            rospy.loginfo(f"[unicorn_intersection_node] Received stop line pose: {self.stop_line_pose}")
+            rospy.loginfo(f"[{self.node_name}] Received stop line pose: x={self.stop_line_pose.x:.3f}, y={self.stop_line_pose.y:.3f}, theta={self.stop_line_pose.theta:.3f}")
             self.check_if_go()
 
     def check_if_go(self):
+        """Verify all requirements met before starting intersection navigation."""
         if (self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
-            rospy.loginfo("[unicorn_intersection_node] We have what we need, preparing for intersection")
+            rospy.loginfo(f"[{self.node_name}] All prerequisites met, preparing for intersection")
 
-            # Store the yaw before alignment
             yaw_before_alignment = self.yaw
 
-            # Align to AprilTag FIRST before calculating trajectory
-            # This ensures trajectory is computed from a well-aligned pose
+            # Align robot heading to AprilTag before trajectory planning
             if self.align_to_apriltag:
-                rospy.loginfo("[unicorn_intersection_node] Aligning to AprilTag before trajectory calculation")
-                rospy.loginfo(f"[unicorn_intersection_node] Yaw before alignment: {yaw_before_alignment:.3f} rad ({np.degrees(yaw_before_alignment):.1f} deg)")
+                # rospy.loginfo(f"[{self.node_name}] Yaw before alignment: {yaw_before_alignment:.3f} rad")
                 self.align_to_apriltag_heading()
-                rospy.loginfo(f"[unicorn_intersection_node] Yaw after alignment: {self.yaw:.3f} rad ({np.degrees(self.yaw):.1f} deg)")
+                # rospy.loginfo(f"[{self.node_name}] Yaw after alignment: {self.yaw:.3f} rad")
 
-                # Calculate the heading correction applied during alignment
+                # Apply heading correction to stop_line_pose
                 heading_correction = self.yaw - yaw_before_alignment
-                rospy.loginfo(f"[unicorn_intersection_node] Heading correction during alignment: {heading_correction:.3f} rad ({np.degrees(heading_correction):.1f} deg)")
-
-                # Apply this correction to the stop_line_pose theta
-                # This updates the stop line's orientation to match the aligned heading
+                # rospy.loginfo(f"[{self.node_name}] Heading correction: {heading_correction:.3f} rad")
                 self.stop_line_pose.theta -= heading_correction
-                rospy.loginfo(f"[unicorn_intersection_node] Updated stop_line_pose.theta to: {self.stop_line_pose.theta:.3f} rad")
 
-            # Now calculate trajectory from the aligned pose
-            rospy.loginfo("[unicorn_intersection_node] Calculating reference trajectory from aligned pose")
+            # Calculate trajectory from aligned pose
             self.reference_trajectory = self.calculate_goal_trajectory()
-            rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
             self.intersection_planning()
+
             if self.negotiation_end and self.internal_state != "EXECUTING":
                 car_control_msg = Twist2DStamped()
                 car_control_msg.header.stamp = rospy.Time.now()
@@ -278,7 +262,7 @@ class UnicornIntersectionNode(DTROS):
                 car_control_msg.v = 0
                 car_control_msg.omega = 0
                 self.car_cmd.publish(car_control_msg)
-                rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
+                rospy.loginfo(f"[{self.node_name}] Starting intersection navigation")
                 self.internal_state = "EXECUTING"
         else:
             self.intersection_planning()
@@ -795,7 +779,7 @@ class UnicornIntersectionNode(DTROS):
         return g.SE2_from_xytheta([ros_pose.x, ros_pose.y, ros_pose.theta])
 
     def cbTurnType(self, msg):
-        # Ignore turn type messages in joystick mode
+        """Process turn type decision from random_april_tag_turns_node."""
         if self.fsm_state == "NORMAL_JOYSTICK_CONTROL":
             return
 
@@ -803,19 +787,16 @@ class UnicornIntersectionNode(DTROS):
             return
 
         self.turn_type = msg.turn_type
-        # Store tag id if provided (used for Apriltag alignment)
         self.turn_tag_id = getattr(msg, "tag_id", None)
         self.turn_type_received = True
-        rospy.loginfo(f"[unicorn_intersection_node] Received turn type: {self.turn_type} from tag {self.turn_tag_id}")
+        rospy.loginfo(f"[{self.node_name}] Received turn type: {self.turn_type} from tag {self.turn_tag_id}")
 
-        # Publish stop command to ensure robot is stationary before proceeding
-        # This clears any residual wheel commands from AprilTag scanning
+        # Stop robot to clear residual scanning commands
         stop_cmd = Twist2DStamped()
         stop_cmd.header.stamp = rospy.Time.now()
         stop_cmd.v = 0.0
         stop_cmd.omega = 0.0
         self.car_cmd.publish(stop_cmd)
-        rospy.loginfo(f"[unicorn_intersection_node] Published stop command after receiving turn type")
 
         self.check_if_go()
 

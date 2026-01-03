@@ -19,23 +19,19 @@ class RandomAprilTagTurnsNode(DTROS):
             node_type=NodeType.PERCEPTION,
             fsm_controlled=True)
 
-        # Save the name of the node
         self.node_name = node_name
         self.turn_type = -1
         rospy.loginfo(f"[{self.node_name}] Initializing.")
 
-        # Setup parameters
+        # AprilTag filtering parameters
         self.dis_max = self.setupParameter("~dis_max", 1.0)
         self.angle_min = self.setupParameter("~angle_min", 90)
         self.angle_max = self.setupParameter("~angle_max", 270)
         self.horizontal_angle_threshold = self.setupParameter("~horizontal_angle_threshold", -77)
 
-        # Parameters for pivot scan behavior ---
-        # speed: wheel speed magnitude for pivot (left = +s, right = -s)
-        self.scan_speed = 0.05
-        # duration: how long to rotate (in seconds) when no tag is detected
-        self.scan_duration = 0.5
-        # Internal scan state
+        # Pivot scan behavior when no tag is detected
+        self.scan_speed = 0.05  # Wheel speed for pivot rotation
+        self.scan_duration = 0.5  # How long to rotate per scan cycle (seconds)
         self._scan_active = False
         self._scan_end_time = rospy.Time(0)
 
@@ -78,13 +74,13 @@ class RandomAprilTagTurnsNode(DTROS):
         self._publish_wheels(0.0, 0.0)
 
     def cbTag(self, tag_msgs):
-            # loop through list of april tags to
-            # find the nearest apriltag
+            """Process AprilTag detections and select nearest valid intersection sign."""
             dis_min = 999
             idx_min = -1
+
             for idx, taginfo in enumerate(tag_msgs.infos):
+                # Only process intersection topology signs
                 if taginfo.tag_type == taginfo.SIGN:
-                    # we need to make sure it's a sign that tells us topology
                     if taginfo.traffic_sign_type in {
                         taginfo.NO_RIGHT_TURN,
                         taginfo.LEFT_T_INTERSECT,
@@ -97,7 +93,7 @@ class RandomAprilTagTurnsNode(DTROS):
                         pos = tag_det.transform.translation
                         distance = math.sqrt(pos.x**2 + pos.y**2 + pos.z**2)
 
-                        #Finding the anglular difference between tag normal and camera
+                        # Calculate tag orientation relative to camera
                         q = (
                             tag_det.transform.rotation.x,
                             tag_det.transform.rotation.y,
@@ -108,103 +104,96 @@ class RandomAprilTagTurnsNode(DTROS):
                         tag_normal_vector = R[:, 2]
                         dot_product = tag_normal_vector[2]
 
-                        # Calculate angle between tag normal and camera Z-axis
-                        # dot_product close to -1 means tag is perpendicular (facing camera)
-                        # dot_product close to 0 means tag is at 90 degrees (sideways)
+                        # Angle between tag normal and camera z-axis
+                        # ~180° means tag faces camera (perpendicular to robot)
                         angle_rad = numpy.arccos(numpy.clip(dot_product, -1.0, 1.0))
                         angle_deg = numpy.degrees(angle_rad)
 
-                        # Calculate horizontal viewing angle (left/right position in camera view)
-                        # pos.x is forward distance, pos.y is lateral offset
-                        # Horizontal angle: negative = right, positive = left
+                        # Horizontal viewing angle (lateral position in camera view)
                         horizontal_angle = numpy.degrees(numpy.arctan2(pos.y, pos.x))
 
-                        #rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] turn type: {taginfo.id}; angle: {angle_deg:.1f} deg; distance: {distance:.3f}; horizontal: {horizontal_angle:.1f} deg")
+                        # rospy.loginfo(f"[{self.node_name}] Tag {taginfo.id}: angle={angle_deg:.1f}°, distance={distance:.3f}m, horizontal={horizontal_angle:.1f}°")
 
-                        # Ignore tags that are more than 45 degrees from perpendicular
-                        # We want tags facing roughly towards the camera (angle close to 180 degrees)
-                        rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] angle_deg: {angle_deg:.1f} deg, dot_product: {dot_product:.3f}")
+                        # Filter 1: Perpendicularity check
+                        # Reject tags not facing camera or at oblique angles
                         if angle_deg < self.angle_min or angle_deg > self.angle_max or abs(dot_product) < 0.707:
-                            #rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag {taginfo.id} at {angle_deg:.1f} degrees (not perpendicular)")
                             continue
 
-                        # Ignore tags on the left side of camera view
-                        # Horizontal viewing angle threshold is configurable
-                        # This is robust regardless of robot position
+                        # Filter 2: Horizontal angle check
+                        # Reject tags on left side or already passed
                         if horizontal_angle < self.horizontal_angle_threshold:
-                            #rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag {taginfo.id} at horizontal angle {horizontal_angle:.1f} degrees (< {self.horizontal_angle_threshold} threshold)")
                             continue
 
+                        # Filter 3: Distance check
                         if distance > self.dis_max:
-                            #rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag {taginfo.id} at distance={distance:.3f} (too far)")
                             continue
 
+                        # Select nearest valid tag
                         if distance < dis_min:
                             dis_min = distance
                             idx_min = idx
 
+            # No valid tag found - initiate pivot scan
             if idx_min == -1:
-                rospy.logwarn("[RANDOM_APRIL_TAG_TURNS_NODE]: Unable to determine available turns at intersection, "
-                              "no appropriate signs detected. Duckiebot will pivot until one is detected")
+                rospy.logwarn("[RANDOM_APRIL_TAG_TURNS_NODE]: No valid intersection sign detected, starting pivot scan")
                 now = rospy.Time.now()
 
-                # If we are not already scanning, start a scan
                 if not self._scan_active:
                     self._start_scan()
 
-                # While scanning and within the scan window, keep publishing pivot command
+                # Continue pivot rotation during scan window
                 if self._scan_active and now < self._scan_end_time:
-                    # Pivot in place: left wheel forward, right wheel backward
                     s = self.scan_speed
                     self._publish_wheels(s, -s)
                 else:
-                    # Scan window over: stop the scan and stop wheels
                     self._stop_scan()
+
+            # Valid tag found - determine available turns
             else:
                 self._stop_scan()
                 taginfo = (tag_msgs.infos)[idx_min]
-                # Get the validated tag detection
                 validated_tag_detection = (tag_msgs.detections)[idx_min]
 
+                # Determine available turns based on sign type
                 availableTurns = []
-                # go through possible intersection types
                 signType = taginfo.traffic_sign_type
                 if signType == taginfo.NO_RIGHT_TURN or signType == taginfo.LEFT_T_INTERSECT:
-                    availableTurns = [
-                        0,
-                        1,
-                    ]  # these mystical numbers correspond to the array ordering in open_loop_intersection_control_node (very bad)
+                    availableTurns = [0, 1]  # Left=0, Straight=1
                 elif signType == taginfo.NO_LEFT_TURN or signType == taginfo.RIGHT_T_INTERSECT:
-                    availableTurns = [1, 2]
+                    availableTurns = [1, 2]  # Straight=1, Right=2
                 elif signType == taginfo.FOUR_WAY:
-                    availableTurns = [0, 1, 2]
+                    availableTurns = [0, 1, 2]  # All directions
                 elif signType == taginfo.T_INTERSECTION:
-                    availableTurns = [0, 2]
-                rospy.loginfo(f"[{self.node_name}] reports Available turns are: [{availableTurns}] from tag {taginfo.id}")
-                # now randomly choose a possible direction
+                    availableTurns = [0, 2]  # Left=0, Right=2
+
+                rospy.loginfo(f"[{self.node_name}] Available turns: {availableTurns} from tag {taginfo.id}")
+
+                # Randomly select a turn direction
                 if len(availableTurns) > 0:
                     randomIndex = numpy.random.randint(len(availableTurns))
                     chosenTurn = availableTurns[randomIndex]
                     self.turn_type = chosenTurn
                     self.pub_turn_type.publish(self.turn_type)
 
+                    # Publish turn type with tag ID
                     id_and_type_msg = TurnIDandType()
                     id_and_type_msg.tag_id = taginfo.id
                     id_and_type_msg.turn_type = self.turn_type
                     self.pub_id_and_type.publish(id_and_type_msg)
 
-                    # Publish the validated tag detection so unicorn_intersection_node can use it
+                    # Publish validated tag for alignment
                     self.pub_validated_tag.publish(validated_tag_detection)
 
+                    # Signal intersection navigation can begin
                     intersection_go_msg = BoolStamped()
                     intersection_go_msg.header = tag_msgs.header
                     intersection_go_msg.data = True
                     self.pub_intersection_go.publish(intersection_go_msg)
 
     def setupParameter(self, param_name, default_value):
+        """Load parameter from ROS parameter server with default fallback."""
         value = rospy.get_param(param_name, default_value)
-        rospy.set_param(param_name, value)  # Write to parameter server for transparancy
-        # rospy.loginfo("[%s] %s = %s " %(self.node_name,param_name,value))
+        rospy.set_param(param_name, value)
         return value
 
     def on_shutdown(self):
