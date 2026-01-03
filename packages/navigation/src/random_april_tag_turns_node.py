@@ -6,7 +6,7 @@ import math
 import numpy
 
 import rospy
-from duckietown_msgs.msg import AprilTagsWithInfos, FSMState, TurnIDandType, BoolStamped, WheelsCmdStamped
+from duckietown_msgs.msg import AprilTagsWithInfos, AprilTagDetection, FSMState, TurnIDandType, BoolStamped, WheelsCmdStamped
 from std_msgs.msg import Int16  # Imports msg
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
 import tf
@@ -43,6 +43,7 @@ class RandomAprilTagTurnsNode(DTROS):
         self.pub_turn_type = rospy.Publisher("~turn_type", Int16, queue_size=1, latch=True)
         self.pub_id_and_type = rospy.Publisher("~turn_id_and_type", TurnIDandType, queue_size=1, latch=True)
         self.pub_intersection_go = rospy.Publisher("~intersection_go", BoolStamped, queue_size=1)
+        self.pub_validated_tag = rospy.Publisher("~validated_tag_detection", AprilTagDetection, queue_size=1, latch=True)
         self.pub_wheels = rospy.Publisher(
             "wheels_driver_node/wheels_cmd",
             WheelsCmdStamped,
@@ -122,6 +123,7 @@ class RandomAprilTagTurnsNode(DTROS):
 
                         # Ignore tags that are more than 45 degrees from perpendicular
                         # We want tags facing roughly towards the camera (angle close to 180 degrees)
+                        rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] angle_deg: {angle_deg:.1f} deg, dot_product: {dot_product:.3f}")
                         if angle_deg < self.angle_min or angle_deg > self.angle_max or abs(dot_product) < 0.707:
                             #rospy.loginfo(f"[RANDOM_APRIL_TAG_TURNS_NODE] Ignoring tag {taginfo.id} at {angle_deg:.1f} degrees (not perpendicular)")
                             continue
@@ -161,6 +163,8 @@ class RandomAprilTagTurnsNode(DTROS):
             else:
                 self._stop_scan()
                 taginfo = (tag_msgs.infos)[idx_min]
+                # Get the validated tag detection
+                validated_tag_detection = (tag_msgs.detections)[idx_min]
 
                 availableTurns = []
                 # go through possible intersection types
@@ -188,6 +192,9 @@ class RandomAprilTagTurnsNode(DTROS):
                     id_and_type_msg.tag_id = taginfo.id
                     id_and_type_msg.turn_type = self.turn_type
                     self.pub_id_and_type.publish(id_and_type_msg)
+
+                    # Publish the validated tag detection so unicorn_intersection_node can use it
+                    self.pub_validated_tag.publish(validated_tag_detection)
 
                     intersection_go_msg = BoolStamped()
                     intersection_go_msg.header = tag_msgs.header
