@@ -5,7 +5,7 @@ speed: 0.12
 
 canonical_goal_pose_right: {
   x: 0.3,
-  y: -0.3,
+  y: -0.35,
   theta: -1.57,
 }
 
@@ -17,7 +17,7 @@ canonical_goal_pose_left: {
 
 canonical_goal_pose_straight: {
   x: 0.75,
-  y: 0.0,
+  y: -0.03,  # Slight left offset to curve away from opposite lane
   theta: 0.0,
 }
 

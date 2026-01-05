@@ -9,7 +9,8 @@ from duckietown_msgs.msg import (BoolStamped,
     StopLineReading,
     LEDPattern,
     FSMState,
-    AprilTagDetectionArray
+    AprilTagDetectionArray,
+    AprilTagDetection
     )
 from std_msgs.msg import String
 from duckietown.dtros import DTROS, NodeType, TopicType, DTParam, ParamType
@@ -56,10 +57,13 @@ class UnicornIntersectionNode(DTROS):
         self.debug = False
         self.apriltag_detections = {}
         self.turn_tag_id = None
+        self.validated_tag_detection = None  # Store the validated tag from random_april_tag_turns_node
 
 
         ## Subscribers
         self.sub_turn_type = rospy.Subscriber("~turn_id_and_type", TurnIDandType, self.cbTurnType)
+        # Subscribe to validated tag detection from random_april_tag_turns_node
+        self.sub_validated_tag = rospy.Subscriber("random_april_tag_turns_node/validated_tag_detection", AprilTagDetection, self.cbValidatedTag, queue_size=1)
         self.sub_encoder_left = message_filters.Subscriber("~left_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_encoder_right = message_filters.Subscriber("~right_wheel_encoder_driver_node/tick", WheelEncoderStamped)
         self.sub_stop_line_reading = rospy.Subscriber("~stop_line_reading", StopLineReading, self.cbStopLineReading)
@@ -142,21 +146,21 @@ class UnicornIntersectionNode(DTROS):
         self.led_priority_set = False
         self.led_ready_set = False
 
+        # Track FSM state to abort operations when switching modes
+        self.fsm_state = "LANE_FOLLOWING"  # Default state
+
         self.log("Initialialized unicorn intersection node")
 
     def onFSMStateChange(self, msg):
-        """
-        Callback for FSM state changes. Reset odometry and state when switching to joystick control.
-        This is automatically called by DTROS when fsm_controlled=True.
-        """
+        """Handle FSM state transitions and reset node state accordingly."""
         new_state = msg.state
+        self.fsm_state = new_state
         rospy.loginfo(f"[{self.node_name}] FSM state changed to: {new_state}")
 
-        # Reset odometry and state when switching to joystick control
         if new_state == "NORMAL_JOYSTICK_CONTROL":
-            rospy.loginfo(f"[{self.node_name}] Switching to joystick control - resetting state")
+            # Reset all state when entering joystick mode
+            rospy.loginfo(f"[{self.node_name}] Entering joystick control - resetting state")
             self.reset_odometry()
-            # Reset intersection state so it can recalculate trajectory when returning to autopilot
             self.internal_state = "READY"
             self.stop_line_pose_received = False
             self.turn_type_received = False
@@ -169,45 +173,88 @@ class UnicornIntersectionNode(DTROS):
             self.current_led_pattern_type = None
             self.stop_line_pose = Pose2D()
             self.apriltag_detections = {}
+            self.validated_tag_detection = None
+            self.reference_trajectory = []
+            self.iter_ = 0
+
+        elif new_state == "LANE_FOLLOWING":
+            # Full reset when returning to autopilot
+            rospy.loginfo(f"[{self.node_name}] Returning to autopilot - full reset")
+            self.reset_odometry()
+            self.internal_state = "READY"
+            self.stop_line_pose_received = False
+            self.turn_type_received = False
+            self.g_stop_pose_plan = None
+            self.priority_level = 0
+            self.negotiation_end = False
+            self.led_priority_set = False
+            self.led_ready_set = False
+            self.current_led_pattern = None
+            self.current_led_pattern_type = None
+            self.stop_line_pose = Pose2D()
+            self.apriltag_detections = {}
+            self.validated_tag_detection = None
+            self.reference_trajectory = []
+            self.iter_ = 0
+
+            # Clear any stale wheel commands
+            stop_cmd = Twist2DStamped()
+            stop_cmd.header.stamp = rospy.Time.now()
+            stop_cmd.v = 0.0
+            stop_cmd.omega = 0.0
+            self.car_cmd.publish(stop_cmd)
 
         elif new_state == "INTERSECTION_CONTROL":
-            # Re-apply LED pattern when entering intersection control
+            # Re-apply LED pattern after FSM transition
             if self.current_led_pattern is not None:
-                rospy.loginfo(f"[{self.node_name}] Re-applying LED pattern after FSM state change")
                 rospy.Timer(rospy.Duration(0.3), lambda event: self._reapply_led_pattern(), oneshot=True)
-            # Start periodic re-application timer during execution
             if self.internal_state == "EXECUTING" and self.current_led_pattern is not None:
                 self._start_led_pattern_timer()
-        elif new_state != "INTERSECTION_CONTROL":
-            # Stop LED pattern timer when leaving intersection control
+        else:
             self._stop_led_pattern_timer()
     
     def cbStopLineReading(self, msg):
+        """Process stop line detections from stop_line_filter_node."""
+        if self.fsm_state == "NORMAL_JOYSTICK_CONTROL":
+            return
+
         if self.stop_line_pose_received:
             return
 
-        # Accept stop line reading when at_stop_line is True
-        # Note: stop_pose.theta can legitimately be 0.0 if robot is perfectly aligned
         if msg.at_stop_line:
+            # Validate that the stop line pose is reasonable (not at origin)
+            # A stop line at exactly (0, 0) is likely invalid/stale
+            # if abs(msg.stop_pose.x) < 0.01 and abs(msg.stop_pose.y) < 0.01:
+            #     rospy.logwarn(f"[unicorn_intersection_node] Ignoring invalid stop line pose at origin: {msg.stop_pose}")
+            #     return
+
             self.stop_line_pose = msg.stop_pose
             self.stop_line_pose_received = True
-            rospy.loginfo(f"[unicorn_intersection_node] Received stop line pose: {self.stop_line_pose}")
+            rospy.loginfo(f"[{self.node_name}] Received stop line pose: x={self.stop_line_pose.x:.3f}, y={self.stop_line_pose.y:.3f}, theta={self.stop_line_pose.theta:.3f}")
             self.check_if_go()
 
     def check_if_go(self):
+        """Verify all requirements met before starting intersection navigation."""
         if (self.stop_line_pose_received and self.turn_type_received and self.internal_state == "READY"):
-            rospy.loginfo("[unicorn_intersection_node] We have what we need, preparing for intersection")
-            # Align to AprilTag FIRST before calculating trajectory
-            # This ensures trajectory is computed from a well-aligned pose
+            rospy.loginfo(f"[{self.node_name}] All prerequisites met, preparing for intersection")
+
+            yaw_before_alignment = self.yaw
+
+            # Align robot heading to AprilTag before trajectory planning
             if self.align_to_apriltag:
-                rospy.loginfo("[unicorn_intersection_node] Aligning to AprilTag before trajectory calculation")
+                # rospy.loginfo(f"[{self.node_name}] Yaw before alignment: {yaw_before_alignment:.3f} rad")
                 self.align_to_apriltag_heading()
-            
-            # Now calculate trajectory from the aligned pose
-            rospy.loginfo("[unicorn_intersection_node] Calculating reference trajectory from aligned pose")
+                # rospy.loginfo(f"[{self.node_name}] Yaw after alignment: {self.yaw:.3f} rad")
+
+                # Apply heading correction to stop_line_pose
+                heading_correction = self.yaw - yaw_before_alignment
+                # rospy.loginfo(f"[{self.node_name}] Heading correction: {heading_correction:.3f} rad")
+                self.stop_line_pose.theta -= heading_correction
+
+            # Calculate trajectory from aligned pose
             self.reference_trajectory = self.calculate_goal_trajectory()
-            rospy.loginfo(f"[unicorn_intersection_node] Reference trajectory calculated: {self.reference_trajectory}")
             self.intersection_planning()
+
             if self.negotiation_end and self.internal_state != "EXECUTING":
                 car_control_msg = Twist2DStamped()
                 car_control_msg.header.stamp = rospy.Time.now()
@@ -215,7 +262,7 @@ class UnicornIntersectionNode(DTROS):
                 car_control_msg.v = 0
                 car_control_msg.omega = 0
                 self.car_cmd.publish(car_control_msg)
-                rospy.loginfo(f"[unicorn_intersection_node] We start intersection navigation")
+                rospy.loginfo(f"[{self.node_name}] Starting intersection navigation")
                 self.internal_state = "EXECUTING"
         else:
             self.intersection_planning()
@@ -224,6 +271,12 @@ class UnicornIntersectionNode(DTROS):
                       f"turn_type_received: {self.turn_type_received} "
                       f"internal_state:{self.internal_state} ")
 
+    def cbValidatedTag(self, msg):
+        """Store the validated tag detection from random_april_tag_turns_node."""
+        self.validated_tag_detection = msg
+        rospy.loginfo(f"[{self.node_name}] Received validated tag {msg.tag_id} from random_april_tag_turns_node")
+        rospy.loginfo(f"[{self.node_name}] Tag position: x={msg.transform.translation.x:.3f}, y={msg.transform.translation.y:.3f}, z={msg.transform.translation.z:.3f}")
+
     def cbApriltags(self, msg):
         """Store latest Apriltag detections (raw AprilTagDetectionArray) for alignment."""
         if len(msg.detections) == 0:
@@ -231,9 +284,7 @@ class UnicornIntersectionNode(DTROS):
 
         for detection in msg.detections:
             self.apriltag_detections[detection.tag_id] = detection
-            rospy.loginfo(f"[{self.node_name}] Detected tag {detection.tag_id}")
-            rospy.loginfo(detection)
-    
+
     def _scan_for_apriltag(self, tag_id):
         """
         Scan for an AprilTag by rotating left, then right, then returning to center.
@@ -302,26 +353,48 @@ class UnicornIntersectionNode(DTROS):
 
     def align_to_apriltag_heading(self):
         """Rotate robot to align parallel with the Apriltag's x-axis before executing."""
-        # TODO: sometimes the wrong tag is being chosen as target
-
         tag_id = self.turn_tag_id
         if tag_id is None:
             rospy.logwarn(f"[{self.node_name}] align_to_apriltag enabled but no tag_id provided with turn_type.")
             return
 
-        detection = self.apriltag_detections.get(tag_id)
-        rospy.loginfo(f"[{self.node_name}] Detection: {detection} for tag {tag_id}")
-        rospy.loginfo(f"[{self.node_name}] Available tags: {list(self.apriltag_detections)}")
+        # Use the validated tag detection from random_april_tag_turns_node
+        # This tag has already passed geometric filtering (perpendicularity, distance, horizontal angle)
+        detection = self.validated_tag_detection
 
-        # If tag not found, try scanning for it
+        # Validate the tag before using it
+        if detection is not None:
+            # Check if validated tag matches expected tag_id
+            if detection.tag_id != tag_id:
+                rospy.logwarn(f"[{self.node_name}] Validated tag ID {detection.tag_id} does not match expected tag ID {tag_id}!")
+                rospy.logwarn(f"[{self.node_name}] This likely means the validated tag is stale from a previous intersection.")
+                rospy.logwarn(f"[{self.node_name}] Discarding validated tag and falling back to fresh detection.")
+                detection = None
+            else:
+                rospy.loginfo(f"[{self.node_name}] Using validated tag {detection.tag_id} from random_april_tag_turns_node")
+                # Log the tag position for debugging
+                pos_debug = detection.transform.translation
+                rospy.loginfo(f"[{self.node_name}] Validated tag position (camera frame): x={pos_debug.x:.3f}, y={pos_debug.y:.3f}, z={pos_debug.z:.3f}")
+
+        # Fallback: if no validated tag or it was stale, check apriltag_detections dictionary
         if detection is None:
-            rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not currently detected. Starting scan procedure.")
-            rospy.logwarn(f"[{self.node_name}] Available tags: {list(self.apriltag_detections.keys())}")
-            detection = self._scan_for_apriltag(tag_id)
-            # If still not found after scanning, give up and continue without alignment
+            rospy.logwarn(f"[{self.node_name}] No valid validated tag - falling back to apriltag_detections dictionary")
+            rospy.loginfo(f"[{self.node_name}] Available tags in dictionary: {list(self.apriltag_detections.keys())}")
+
+            detection = self.apriltag_detections.get(tag_id)
+
+            # If tag not found, try scanning for it
             if detection is None:
-                rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not found after scanning. Proceeding without alignment.")
-                return
+                rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not in dictionary. Starting scan procedure.")
+                detection = self._scan_for_apriltag(tag_id)
+                # If still not found after scanning, give up and continue without alignment
+                if detection is None:
+                    rospy.logwarn(f"[{self.node_name}] Tag {tag_id} not found after scanning. Proceeding without alignment.")
+                    return
+            else:
+                rospy.loginfo(f"[{self.node_name}] Found tag {tag_id} in apriltag_detections dictionary (not validated!)")
+                pos_debug = detection.transform.translation
+                rospy.loginfo(f"[{self.node_name}] Tag position (camera frame): x={pos_debug.x:.3f}, y={pos_debug.y:.3f}, z={pos_debug.z:.3f}")
 
         prev_state = self.internal_state
         self.internal_state = "ALIGNING"
@@ -366,28 +439,59 @@ class UnicornIntersectionNode(DTROS):
             yaw_option_1 = math.atan2(alignment_direction[1], alignment_direction[0])
             yaw_option_2 = self.shortest_angle(yaw_option_1 + math.pi)
 
+            # Calculate angular errors from current yaw
+            error_1 = self.shortest_angle(yaw_option_1 - self.yaw)
+            error_2 = self.shortest_angle(yaw_option_2 - self.yaw)
+
             # Select the direction with smallest angular error from current yaw
-            error_1 = abs(self.shortest_angle(yaw_option_1 - self.yaw))
-            error_2 = abs(self.shortest_angle(yaw_option_2 - self.yaw))
-            desired_yaw = yaw_option_1 if error_1 < error_2 else yaw_option_2
+            if abs(error_1) < abs(error_2):
+                desired_yaw = yaw_option_1
+                selected_error = error_1
+            else:
+                desired_yaw = yaw_option_2
+                selected_error = error_2
 
             rospy.loginfo(f"[{self.node_name}] Current yaw: {self.yaw:.3f} rad ({np.degrees(self.yaw):.1f} deg)")
             rospy.loginfo(f"[{self.node_name}] Option 1: {yaw_option_1:.3f} rad ({np.degrees(yaw_option_1):.1f} deg), error: {error_1:.3f} rad ({np.degrees(error_1):.1f} deg)")
             rospy.loginfo(f"[{self.node_name}] Option 2: {yaw_option_2:.3f} rad ({np.degrees(yaw_option_2):.1f} deg), error: {error_2:.3f} rad ({np.degrees(error_2):.1f} deg)")
             rospy.loginfo(f"[{self.node_name}] Selected desired yaw (before offset): {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
 
+            # Check if the selected turn angle exceeds the maximum allowed
+            if abs(selected_error) > self.align_tag_max_turn_angle:
+                rospy.logwarn(f"[{self.node_name}] Turn angle {abs(selected_error):.3f} rad ({np.degrees(abs(selected_error)):.1f} deg) exceeds max {self.align_tag_max_turn_angle:.3f} rad ({np.degrees(self.align_tag_max_turn_angle):.1f} deg)")
+                rospy.logwarn(f"[{self.node_name}] Switching to opposite direction to avoid excessive turn")
+                # Switch to the other option
+                if desired_yaw == yaw_option_1:
+                    desired_yaw = yaw_option_2
+                    selected_error = error_2
+                else:
+                    desired_yaw = yaw_option_1
+                    selected_error = error_1
+                rospy.loginfo(f"[{self.node_name}] New desired yaw: {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg), error: {selected_error:.3f} rad ({np.degrees(selected_error):.1f} deg)")
+
+        # Apply heading offset
+        # Positive offset = rotate counterclockwise (left), Negative = clockwise (right)
+        desired_yaw_with_offset = self.shortest_angle(desired_yaw + self.align_tag_heading_offset)
+
+        if abs(self.align_tag_heading_offset) > 0.01:  # Only log if offset is significant
+            rospy.loginfo(f"[{self.node_name}] Heading offset: {self.align_tag_heading_offset:.3f} rad ({np.degrees(self.align_tag_heading_offset):.1f} deg)")
+            rospy.loginfo(f"[{self.node_name}] Final desired yaw (with offset): {desired_yaw_with_offset:.3f} rad ({np.degrees(desired_yaw_with_offset):.1f} deg)")
+
+        desired_yaw = desired_yaw_with_offset
+
         if abs(desired_yaw) > 0.5: #TODO: find problem of wrong tag being chosen as target instead of hard constraint
-            rospy.logwarn(f"[{self.node_name}] Desired yaw is too large, cannot align to AprilTag")
+            self.internal_state = prev_state
+            rospy.logwarn(f"[{self.node_name}] Desired yaw {desired_yaw:.3f} is too large, cannot align to AprilTag")
             return
 
         start_time = rospy.Time.now()
         rate = rospy.Rate(20)
 
-        rospy.loginfo(f"[{self.node_name}] Aligning to AprilTag with desired yaw: {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
+        rospy.loginfo(f"[{self.node_name}] Aligning to AprilTag with final desired yaw: {desired_yaw:.3f} rad ({np.degrees(desired_yaw):.1f} deg)")
 
         while not rospy.is_shutdown():
             yaw_err = self.shortest_angle(desired_yaw - self.yaw)
-            rospy.loginfo(f"[{self.node_name}] Yaw error: {yaw_err:.3f} rad ({np.degrees(yaw_err):.1f} deg)")
+            # rospy.loginfo(f"[{self.node_name}] Yaw error: {yaw_err:.3f} rad ({np.degrees(yaw_err):.1f} deg)")
             if abs(yaw_err) < self.align_tag_tolerance:
                 break
             elapsed = (rospy.Time.now() - start_time).to_sec()
@@ -416,7 +520,7 @@ class UnicornIntersectionNode(DTROS):
     # goal pose relative to the stop line. If not using the stop line then we can use some fixed offset based on the
     # stop line distance? TODO
     def calculate_goal_trajectory(self):
-        self.stop_line_pose.theta = 0.0 # assumes robot is aligned
+        # self.stop_line_pose.theta = 0.0 # assumes robot is aligned
         g_stop_pose = self.ros_pose_to_geometry(self.stop_line_pose)
         rospy.loginfo(f"[unicorn_intersection_node] stop_line_pose: {self.stop_line_pose}")
         self.g_stop_pose_plan = g_stop_pose
@@ -454,6 +558,7 @@ class UnicornIntersectionNode(DTROS):
             p, d = g.translation_angle_from_SE2(robot_frame_via_pose)
             rospy.loginfo(f"[unicorn_intersection_node] via_pose in robot frame: position {p}, angle  {d}")
 
+            # Segment 1: Stop → Via (both in stop-line frame)
             seg1_count = max(1, self.left_num_waypoints // 2)
             seg2_count = max(1, self.left_num_waypoints - seg1_count)
 
@@ -674,14 +779,25 @@ class UnicornIntersectionNode(DTROS):
         return g.SE2_from_xytheta([ros_pose.x, ros_pose.y, ros_pose.theta])
 
     def cbTurnType(self, msg):
+        """Process turn type decision from random_april_tag_turns_node."""
+        if self.fsm_state == "NORMAL_JOYSTICK_CONTROL":
+            return
+
         if self.turn_type_received:
             return
 
         self.turn_type = msg.turn_type
-        # Store tag id if provided (used for Apriltag alignment)
         self.turn_tag_id = getattr(msg, "tag_id", None)
         self.turn_type_received = True
-        rospy.loginfo(f"[unicorn_intersection_node] Received turn type: {self.turn_type} from tag {self.turn_tag_id}")
+        rospy.loginfo(f"[{self.node_name}] Received turn type: {self.turn_type} from tag {self.turn_tag_id}")
+
+        # Stop robot to clear residual scanning commands
+        stop_cmd = Twist2DStamped()
+        stop_cmd.header.stamp = rospy.Time.now()
+        stop_cmd.v = 0.0
+        stop_cmd.omega = 0.0
+        self.car_cmd.publish(stop_cmd)
+
         self.check_if_go()
 
     def setupParams(self):
@@ -721,6 +837,7 @@ class UnicornIntersectionNode(DTROS):
         self.align_tag_omega_max = self.setupParam("~align_tag_omega_max", 2.0)  # rad/s cap
         self.align_tag_max_time = self.setupParam("~align_tag_max_time", 2.5)  # seconds
         self.align_tag_heading_offset = self.setupParam("~align_tag_heading_offset", 0.0)  # radians offset from perpendicular
+        self.align_tag_max_turn_angle = self.setupParam("~align_tag_max_turn_angle", math.pi / 2)  # radians, max turn before reversing direction
         # AprilTag scan parameters (when tag not initially visible)
         self.align_tag_scan_angle = self.setupParam("~align_tag_scan_angle", 0.4)  # radians (~23 deg)
         self.align_tag_scan_omega = self.setupParam("~align_tag_scan_omega", 0.3)  # rad/s
@@ -831,12 +948,8 @@ class UnicornIntersectionNode(DTROS):
 
         # Draw robot position(s) (transformed into stop-line frame for visualization)
         if self.g_stop_pose_plan is not None:
-            stop_T_robot = g.SE2.multiply(
-                g.SE2.inverse(self.g_stop_pose_plan),
-                g.SE2_from_xytheta([self.x, self.y, self.yaw]),
-            )
-            stop_T_robot_rel = g.SE2.multiply(g.SE2.inverse(self.g_stop_pose_plan), stop_T_robot)
-            norm_pos, norm_heading = g.translation_angle_from_SE2(stop_T_robot_rel)
+            # Draw the inverse of the stop pose as a coordinate frame
+            norm_pos, norm_heading = g.translation_angle_from_SE2(self.g_stop_pose_plan)
             norm_px = to_pixel_coords(norm_pos)
             cv2.circle(img, norm_px, 12, (0, 200, 0), -1)  # Pale green
             arrow_length = 30
@@ -1061,7 +1174,7 @@ class UnicornIntersectionNode(DTROS):
     def update_leds(self, color_list, frequency=0.0, force=False):
         """
         Set a custom LED pattern using a list of colors.
-        
+
         Args:
             color_list: List of 5 color names (e.g., ['red', 'blue', 'white', 'green', 'yellow'])
             frequency: Blinking frequency in Hz (0.0 for solid)
